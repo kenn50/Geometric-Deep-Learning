@@ -1,0 +1,7 @@
+README.md
+pyproject.toml
+src/CustomModules/__init__.py
+src/geometric_deep_learning.egg-info/PKG-INFO
+src/geometric_deep_learning.egg-info/SOURCES.txt
+src/geometric_deep_learning.egg-info/dependency_links.txt
+src/geometric_deep_learning.egg-info/top_level.txt
