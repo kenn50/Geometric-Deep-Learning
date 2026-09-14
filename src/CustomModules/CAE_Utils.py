@@ -13,12 +13,13 @@ from CustomModules.util import farthest_point_sample
 
 
 
-
-
 class CAE(nn.Module):
     def __init__(self, m, l, d, hidden_dim, hidden_chart_dim, hidden_predictor_dim, chart_amount):
         super().__init__()
         self.chart_amount = chart_amount
+        self.m = m
+        self.l = l
+        self.d = d
         self.encoder = nn.Sequential(nn.Linear(m, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, l))
         self.decoder = nn.Sequential(nn.Linear(l, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, m))
         self.chart_predictor = nn.Sequential(nn.Linear(m, hidden_dim),nn.ReLU(), nn.Linear(hidden_dim, chart_amount))
@@ -78,53 +79,71 @@ class CAE(nn.Module):
 
 
     
-def pre_train_cae(epochs: int, x_train, network : CAE, device: torch.device):
-    x, indices = farthest_point_sample(x_train, K=network.chart_amount)
+def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device):
+    x, _ = farthest_point_sample(x_train, k=network.chart_amount)
     optimizer = torch.optim.Adam(network.parameters(), lr=0.0001)
-    for epoch in range(epochs):
+    for epoch in range(num_epochs):
         optimizer.zero_grad()
-        z_middle = network.encode(x)
+        z_middle = network.encode(x) # (chart_amount, l)
         loss = 0
         for i in range(network.chart_amount):
-            z_latent = network.chart_encode(z_middle[i].unsqueeze(0), i)
-            z_middle_recon = network.chart_decode(z_latent, i)
-            x_recon = network.decode(z_middle_recon)
-            loss += F.mse_loss(x_recon, x[i]) + F.mse_loss(z_latent, torch.zeros_like(z_latent)+0.5) - torch.log(network.predict(x[i])[i] + 1e-8)
+            z_latent = network.chart_encode(z_middle[i], i).unsqueeze(0) # (d) => unsqueeze to (1, d)
+            assert(z_latent.shape[0] == 1)
+            z_middle_recon = network.chart_decode(z_latent, i) # (1, l)
+            x_recon = network.decode(z_middle_recon) # 1, m)
+            loss += F.mse_loss(x_recon, x[i]) + F.mse_loss(z_latent, torch.zeros_like(z_latent)+0.5) - torch.log(network.predict(x)[i, i] + 1e-8)
 
         loss.backward()
         optimizer.step()
 
-def train_cae(epochs: int, x_train_loader: DataLoader, network: CAE, device: torch.device):
+def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device: torch.device):
     network.to(device)
-    
+    diag = []
     optimizer = torch.optim.Adam(network.parameters(), lr=0.0001)
-    for epoch in trange(epochs):
+    for epoch in trange(num_epochs):
         for batch in x_train_loader:
             
             batch = batch.to(device)
             optimizer.zero_grad()
             
             z_middle = network.encode(batch) # (bs, d)
+            decoded = network.decode(z_middle) # (bs, D)
+            outer_loss = F.mse_loss(decoded, batch) 
             errors = torch.zeros((len(batch),network.chart_amount), device=device) # (chart_amount, d)
-
-            z_middle_losses = 0
-    
+            regularization_loss = 0
             for i in range(network.chart_amount):
                 z_latent = network.chart_encode(z_middle, i)
                 z_middle_recon = network.chart_decode(z_latent, i)
                 decoded = network.decode(z_middle_recon) # (bs, D)
                 errors[:, i] = torch.norm((decoded - batch), dim = 1)
-                z_middle_losses += F.mse_loss(z_middle, z_middle_recon)
+
+                sampled_points_x= torch.rand((10, 10)).to(device) # (10, d)
+                sampled_points_y = torch.roll(sampled_points_x, shifts=1, dims=0)
+                sampled_diff = sampled_points_x - sampled_points_y
+
+                decoded_sampled_x = network.chart_decode(sampled_points_x, i)
+                decoded_sampled_y = torch.roll(decoded_sampled_x, shifts=1, dims=0)
+                decoded_diff = decoded_sampled_x - decoded_sampled_y
+
+                regularization_loss += F.mse_loss(torch.log(1e-8 + torch.sum(sampled_diff * sampled_diff, dim=1)), torch.log(1e-8 + torch.sum(decoded_diff * decoded_diff, dim=1)))
+
+
+
+
+
+                
+                
 
 
             predicted_probs = network.predict(batch) # (bs, chart_amount)
             log_probs = torch.log(predicted_probs + 1e-8) # (bs, chart_amount)
             
-            loss = torch.min(errors, dim=1).values - torch.sum(F.softmax(-errors, dim = 1) * log_probs, dim=1) + z_middle_losses
+            loss = torch.min(errors, dim=1).values - torch.sum(F.softmax(-errors, dim = 1) * log_probs, dim=1) + outer_loss + regularization_loss
             loss = loss.mean()
             loss.backward()
             optimizer.step()
-    
+            diag.append((torch.min(errors, dim=1).values, - torch.sum(F.softmax(-errors, dim = 1) * log_probs, dim=1), outer_loss, regularization_loss))
+    return diag
 
 
 

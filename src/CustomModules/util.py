@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 #Made by ChatGpt 5.6 sol
 def farthest_point_sample(points, k):
@@ -16,7 +17,7 @@ def farthest_point_sample(points, k):
     min_dist = torch.full((N,), float("inf"), device=points.device)
 
     # Start from point 0
-    current = 0
+    current = np.random.randint(0, N)
 
     for i in range(k):
         indices[i] = current
