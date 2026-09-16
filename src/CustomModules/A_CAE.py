@@ -48,7 +48,7 @@ class CAE(nn.Module):
         return z_alpha
 
     def chart_multi_encode(self, z, alpha : torch.Tensor): #for when we want to encode a batch of points with different charts
-            z_alpha = torch.stack([self.get_submodule(f"encoder_{i}")(z[j].unsqueeze(0)) for j, i in enumerate(alpha)])
+            z_alpha = torch.stack([self.get_submodule(f"encoder_{i}")(z[j]) for j, i in enumerate(alpha)])
             return z_alpha
     
     
@@ -57,7 +57,7 @@ class CAE(nn.Module):
         return z
 
     def chart_multi_decode(self, z_alpha, alpha : torch.Tensor): #for when we want to encode a batch of points with different charts
-            z_recon = torch.stack([self.get_submodule(f"decoder_{i}")(z_alpha[j].unsqueeze(0)) for j, i in enumerate(alpha)])
+            z_recon = torch.stack([self.get_submodule(f"decoder_{i}")(z_alpha[j]) for j, i in enumerate(alpha)])
             return z_recon
 
     def encode_decode(self, x):
@@ -80,7 +80,7 @@ class CAE(nn.Module):
 
     
 def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device):
-    x, _ = farthest_point_sample(x_train, k=network.chart_amount)
+    x= torch.tensor(farthest_point_sample(x_train, k=network.chart_amount)[0], dtype=torch.float32) # (chart_amount, m)
     optimizer = torch.optim.Adam(network.parameters(), lr=0.0001)
     for epoch in range(num_epochs):
         optimizer.zero_grad()
@@ -117,7 +117,7 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
                 decoded = network.decode(z_middle_recon) # (bs, D)
                 errors[:, i] = torch.norm((decoded - batch), dim = 1)
 
-                sampled_points_x= torch.rand((10, 10)).to(device) # (10, d)
+                sampled_points_x= torch.rand((10, network.d)).to(device) # (10, d)
                 sampled_points_y = torch.roll(sampled_points_x, shifts=1, dims=0)
                 sampled_diff = sampled_points_x - sampled_points_y
 
@@ -127,12 +127,6 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
 
                 regularization_loss += F.mse_loss(torch.log(1e-8 + torch.sum(sampled_diff * sampled_diff, dim=1)), torch.log(1e-8 + torch.sum(decoded_diff * decoded_diff, dim=1)))
 
-
-
-
-
-                
-                
 
 
             predicted_probs = network.predict(batch) # (bs, chart_amount)
