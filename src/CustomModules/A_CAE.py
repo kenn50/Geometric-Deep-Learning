@@ -14,20 +14,22 @@ from CustomModules.util import farthest_point_sample
 
 
 class CAE(nn.Module):
-    def __init__(self, m, l, d, hidden_dim, hidden_chart_dim, hidden_predictor_dim, chart_amount):
+    def __init__(self, m, l, d, hidden_dim, hidden_chart_dim, hidden_predictor_dim, chart_amount, activation_outer = nn.ReLU(), activation_inner = nn.ReLU()):
         super().__init__()
         self.chart_amount = chart_amount
         self.m = m
         self.l = l
         self.d = d
-        self.encoder = nn.Sequential(nn.Linear(m, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, l))
-        self.decoder = nn.Sequential(nn.Linear(l, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, m))
-        self.chart_predictor = nn.Sequential(nn.Linear(m, hidden_dim),nn.ReLU(), nn.Linear(hidden_dim, chart_amount))
+        self.activation_outer = activation_outer
+        self.activation_inner = activation_inner
+        self.encoder = nn.Sequential(nn.Linear(m, hidden_dim), activation_outer, nn.Linear(hidden_dim, l))
+        self.decoder = nn.Sequential(nn.Linear(l, hidden_dim), activation_outer, nn.Linear(hidden_dim, m))
+        self.chart_predictor = nn.Sequential(nn.Linear(m, hidden_predictor_dim), activation_outer, nn.Linear(hidden_predictor_dim, chart_amount))
         
 
         for alpha in range(chart_amount):
-            self.add_module(f"encoder_{alpha}", nn.Sequential(nn.Linear(l, hidden_chart_dim), nn.ReLU(), nn.Linear(hidden_chart_dim, d)))
-            self.add_module(f"decoder_{alpha}", nn.Sequential(nn.Linear(d, hidden_chart_dim), nn.ReLU(), nn.Linear(hidden_chart_dim, l)))
+            self.add_module(f"encoder_{alpha}", nn.Sequential(nn.Linear(l, hidden_chart_dim), activation_inner, nn.Linear(hidden_chart_dim, d)))
+            self.add_module(f"decoder_{alpha}", nn.Sequential(nn.Linear(d, hidden_chart_dim), activation_inner, nn.Linear(hidden_chart_dim, l)))
 
 
     def encode(self, x):
@@ -128,15 +130,18 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
                 regularization_loss += F.mse_loss(torch.log(1e-8 + torch.sum(sampled_diff * sampled_diff, dim=1)), torch.log(1e-8 + torch.sum(decoded_diff * decoded_diff, dim=1)))
 
 
-
+            target_probs = F.softmax(-errors.detach(), dim=1)
+            
             predicted_probs = network.predict(batch) # (bs, chart_amount)
             log_probs = torch.log(predicted_probs + 1e-8) # (bs, chart_amount)
             
-            loss = torch.min(errors, dim=1).values - torch.sum(F.softmax(-errors, dim = 1) * log_probs, dim=1) + outer_loss + regularization_loss
+            
+            
+            loss = torch.min(errors, dim=1).values - torch.sum(target_probs * log_probs, dim=1)  + outer_loss + regularization_loss
             loss = loss.mean()
             loss.backward()
             optimizer.step()
-            diag.append((torch.min(errors, dim=1).values, - torch.sum(F.softmax(-errors, dim = 1) * log_probs, dim=1), outer_loss, regularization_loss))
+            diag.append((torch.min(errors, dim=1).values, - torch.sum(target_probs * log_probs, dim=1), outer_loss, regularization_loss))
     return diag
 
 
