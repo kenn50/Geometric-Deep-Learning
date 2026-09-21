@@ -6,6 +6,7 @@ import numpy as np
 from tqdm import tqdm, trange
 
 from CustomModules.util import farthest_point_sample
+from CustomModules.util import FFNN
 
 
 
@@ -14,7 +15,7 @@ from CustomModules.util import farthest_point_sample
 
 
 class CAE(nn.Module):
-    def __init__(self, m, l, d, hidden_dim, hidden_chart_dim, hidden_predictor_dim, chart_amount, activation_outer = nn.ReLU(), activation_inner = nn.ReLU()):
+    def __init__(self, m, l, d, outer_structure, inner_structure, predictor_structure, chart_amount, activation_outer = nn.ReLU(), activation_inner = nn.ReLU()):
         super().__init__()
         self.chart_amount = chart_amount
         self.m = m
@@ -22,14 +23,13 @@ class CAE(nn.Module):
         self.d = d
         self.activation_outer = activation_outer
         self.activation_inner = activation_inner
-        self.encoder = nn.Sequential(nn.Linear(m, hidden_dim), activation_outer, nn.Linear(hidden_dim, l))
-        self.decoder = nn.Sequential(nn.Linear(l, hidden_dim), activation_outer, nn.Linear(hidden_dim, m))
-        self.chart_predictor = nn.Sequential(nn.Linear(m, hidden_predictor_dim), activation_outer, nn.Linear(hidden_predictor_dim, chart_amount))
-        
+        self.encoder = FFNN([m] + outer_structure + [l], activation=activation_outer)
+        self.decoder = FFNN([l] + outer_structure + [m], activation=activation_outer)
+        self.chart_predictor = FFNN([m] + predictor_structure + [chart_amount], activation=activation_outer)
 
         for alpha in range(chart_amount):
-            self.add_module(f"encoder_{alpha}", nn.Sequential(nn.Linear(l, hidden_chart_dim), activation_inner, nn.Linear(hidden_chart_dim, d)))
-            self.add_module(f"decoder_{alpha}", nn.Sequential(nn.Linear(d, hidden_chart_dim), activation_inner, nn.Linear(hidden_chart_dim, l)))
+            self.add_module(f"encoder_{alpha}", FFNN([l] + inner_structure + [d], activation=activation_inner))
+            self.add_module(f"decoder_{alpha}", FFNN([d] + inner_structure + [l], activation=activation_inner))
 
 
     def encode(self, x):
@@ -98,10 +98,10 @@ def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device)
         loss.backward()
         optimizer.step()
 
-def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device: torch.device):
+def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device: torch.device, lr=1e-4):
     network.to(device)
     diag = []
-    optimizer = torch.optim.Adam(network.parameters(), lr=0.0001)
+    optimizer = torch.optim.Adam(network.parameters(), lr=lr)
     for epoch in trange(num_epochs):
         for batch in x_train_loader:
             
@@ -119,7 +119,7 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
                 decoded = network.decode(z_middle_recon) # (bs, D)
                 errors[:, i] = torch.norm((decoded - batch), dim = 1)
 
-                sampled_points_x= torch.rand((10, network.d)).to(device) # (10, d)
+                sampled_points_x= torch.rand((100, network.d)).to(device) # (10, d)
                 sampled_points_y = torch.roll(sampled_points_x, shifts=1, dims=0)
                 sampled_diff = sampled_points_x - sampled_points_y
 
@@ -137,7 +137,7 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
             
             
             
-            loss = torch.min(errors, dim=1).values - torch.sum(target_probs * log_probs, dim=1)  + outer_loss + regularization_loss
+            loss = torch.min(errors, dim=1).values - torch.sum(target_probs * log_probs, dim=1)  + outer_loss  #+ regularization_loss
             loss = loss.mean()
             loss.backward()
             optimizer.step()

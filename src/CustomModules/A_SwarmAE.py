@@ -15,6 +15,11 @@ from CustomModules.util import farthest_point_sample
 
 
 
+
+
+
+
+
 class CAE(nn.Module):
     def __init__(self, m, l, d, hidden_dim, hidden_chart_dim, hidden_predictor_dim, chart_amount):
         super().__init__()
