@@ -5,8 +5,8 @@ from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm, trange
 
-from CustomModules.util import farthest_point_sample
-from CustomModules.util import MLP
+from CustomModules.util import *
+
 
 from sklearn.cluster import KMeans
 import numpy as np
@@ -18,92 +18,79 @@ import numpy as np
 
 
 class CAE(nn.Module):
-    def __init__(self, x_dim, w_dim, z_dim, outer_structure, inner_structure, predictor_structure, chart_amount, activation_outer = nn.ReLU(), activation_inner = nn.ReLU()):
+    def __init__(self, x_dim, z_dim, hidden_structure, predictor_structure, chart_amount, activation = nn.ReLU(), 
+                autoencoder = None):
         """
         x_dim = data dimension
 
-        w_dim = middle layer dimension
-        
         z_dim = chart space dimension
         """
         super().__init__()
+
         
 
-
+        self.autoencoder = autoencoder
         self.chart_amount = chart_amount
         self.x_dim = x_dim # data dimension
-        self.w_dim = w_dim # middle layer dimension
         self.z_dim = z_dim # chart space dimension
-        self.activation_outer = activation_outer
-        self.activation_inner = activation_inner
-        self.encoder = MLP([x_dim] + outer_structure + [w_dim], activation=activation_outer)
-        self.decoder = MLP([w_dim] + outer_structure + [x_dim], activation=activation_outer)
-        self.chart_predictor = MLP([x_dim] + predictor_structure + [chart_amount], activation=activation_outer)
+        self.activation_inner = activation
+
+        self.chart_predictor = MLP([x_dim] + predictor_structure + [chart_amount], activation=activation)
+
+        input_dim = x_dim if not autoencoder else autoencoder.z_dim
+
 
         for chart_index in range(chart_amount):
-            self.add_module(f"encoder_{chart_index}", MLP([w_dim] + inner_structure + [z_dim], activation=activation_inner))
-            self.add_module(f"decoder_{chart_index}", MLP([z_dim] + inner_structure + [w_dim], activation=activation_inner))
-
-
-
-        
-
-    def encode(self, x):
-        z_middle = self.encoder(x)
-        return z_middle
-
-    def decode(self, z):
-        x = self.decoder(z)
-        return x
+            self.add_module(f"encoder_{chart_index}", MLP([input_dim] + hidden_structure + [z_dim], activation=activation))
+            self.add_module(f"decoder_{chart_index}", MLP([z_dim] + hidden_structure + [input_dim], activation=activation))
 
     def predict(self, x):
         logits = self.chart_predictor(x)
         probabililties = F.softmax(logits, dim=1)
         return probabililties
 
-    def chart_encode(self, z, chart_index):
-        z_chart = self.get_submodule(f"encoder_{chart_index}")(z)
-        return z_chart
+    def encode(self, x, chart_index):
+        #if autoencoder is available, we use it first:
+        network_input = x if not self.autoencoder else self.autoencoder.encode(x)
+        chart_index = torch.tensor(chart_index, device=x.device)
 
-    def chart_multi_encode(self, z, chart_indices : torch.Tensor): #for when we want to encode a batch of points with different charts
-            z_chart = torch.stack([self.get_submodule(f"encoder_{i}")(z[j]) for j, i in enumerate(chart_indices)])
-            return z_chart
-    
-    
-    def chart_decode(self, z_alpha, alpha):
-        z = self.get_submodule(f"decoder_{alpha}")(z_alpha)
+        if chart_index.ndim == 0:
+            z = self.get_submodule(f"encoder_{chart_index.item()}")(network_input)
+        else:
+            z = torch.stack([self.get_submodule(f"encoder_{i}")(network_input[j]) for j, i in enumerate(chart_index)])
+
         return z
+    
+    def decode(self, z, chart_indexes):
+        chart_indexes = torch.tensor(chart_indexes, device=z.device)
 
-    def chart_multi_decode(self, z_alpha, alpha : torch.Tensor): #for when we want to encode a batch of points with different charts
-            z_recon = torch.stack([self.get_submodule(f"decoder_{i}")(z_alpha[j]) for j, i in enumerate(alpha)])
-            return z_recon
+        if chart_indexes.ndim == 0:
+            recon = self.get_submodule(f"decoder_{chart_indexes.item()}")(z)
+        else:
+            recon = torch.stack([self.get_submodule(f"decoder_{i}")(z[j]) for j, i in enumerate(chart_indexes)])
 
-    def encode_decode(self, x):
-        z_middle = self.encode(x)
-        probabilities = self.predict(x)
-        alpha = torch.argmax(probabilities, dim=1)
-        z_latent = self.chart_multi_encode(z_middle, alpha)
-        z_recon = self.chart_multi_decode(z_latent, alpha)
-        x_recon = self.decode(z_recon)
-        return x_recon
+        x = self.autoencoder.decode(z) if self.autoencoder else recon
+        return x
+
+
 
 
     
 def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device, lr=1e-3):
     #x= torch.tensor(farthest_point_sample(x_train, k=network.chart_amount)[0], dtype=torch.float32) # (chart_amount, m)
     kmeans = KMeans(n_clusters=network.chart_amount, random_state=np.random.randint(0, 1000), n_init="auto").fit(x_train)
-    
+    x_train = x_train.to(device)
+    network = network.to(device)
     optimizer = torch.optim.Adam(network.parameters(), lr=lr)
     for epoch in trange(num_epochs):
         optimizer.zero_grad()
         loss = 0
         for i in range(network.chart_amount):
             x_sliced = x_train[kmeans.labels_ == i]
-            z_middle = network.encode(x_sliced)
-            z_latent = network.chart_encode(z_middle, i)
-            z_middle_recon = network.chart_decode(z_latent, i) # (1, l)
-            x_recon = network.decode(z_middle_recon) # 1, m)
+            z = network.encode(x_sliced, i)
+            x_recon = network.decode(z, i) # 1, m)
             loss += F.mse_loss(x_recon, x_sliced) - torch.log(network.predict(x_sliced  + 1e-8)[:, i]).mean()
+
 
         loss.backward()
         optimizer.step()
@@ -112,22 +99,24 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
     network.to(device)
     diag = []
     optimizer = torch.optim.Adam(network.parameters(), lr=lr)
-    for epoch in trange(num_epochs):
+    pbar = trange(num_epochs)
+
+    for epoch in pbar:
         for batch in x_train_loader:
             
             batch = batch.to(device)
             optimizer.zero_grad()
-            
-            z_middle = network.encode(batch) # (bs, d)
-            decoded = network.decode(z_middle) # (bs, D)
-            outer_loss = F.mse_loss(decoded, batch) 
+            autoencoder_loss = 0
+            # if network.autoencoder:
+            #     z_middle = network.autoencoder.encode(batch) # (bs, d)
+            #     decoded = network.autoencoder.decode(z_middle) # (bs, D)
+            #     autoencoder_loss = F.mse_loss(decoded, batch)
             errors = torch.zeros((len(batch),network.chart_amount), device=device) # (chart_amount, d)
             regularization_loss = 0
             for i in range(network.chart_amount):
-                z_latent = network.chart_encode(z_middle, i)
-                z_middle_recon = network.chart_decode(z_latent, i)
-                decoded = network.decode(z_middle_recon) # (bs, D)
-                errors[:, i] = torch.norm((decoded - batch), dim = 1)
+                z = network.encode(batch, i)
+                decoded = network.decode(z, i) # (bs, D)
+                errors[:, i] = norm_squared(decoded, batch, dim=1)
 
             target_probs = F.softmax(-errors.detach(), dim=1)
             
@@ -135,12 +124,16 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
             log_probs = torch.log(predicted_probs + 1e-8) # (bs, chart_amount)
             
             
-            
-            loss = torch.min(errors, dim=1).values - torch.sum(target_probs * log_probs, dim=1)  + outer_loss 
+            l1 = torch.min(errors, dim=1).values * 10000
+            loss =  l1 - torch.gather(log_probs, 1, torch.argmin(errors, dim=1).unsqueeze(1))  + autoencoder_loss
             loss = loss.mean()
             loss.backward()
             optimizer.step()
-            diag.append((torch.min(errors, dim=1).values, - torch.sum(target_probs * log_probs, dim=1), outer_loss, regularization_loss))
+
+            pbar.set_postfix(loss=f"{l1.mean().item():.4f}")
+
+
+            diag.append((torch.min(errors, dim=1).values, - torch.sum(target_probs * log_probs, dim=1), autoencoder_loss, regularization_loss))
     return diag
 
 
