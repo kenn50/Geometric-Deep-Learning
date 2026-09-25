@@ -7,7 +7,6 @@ from tqdm import tqdm, trange
 
 from CustomModules.util import farthest_point_sample
 
-
 class AE(nn.Module):
     def __init__(self, m, d, hidden_dim):
         super().__init__()
@@ -52,4 +51,3 @@ def train_ae(num_epochs: int, x_train_loader: DataLoader, network: AE, device: t
 
 
 
-    

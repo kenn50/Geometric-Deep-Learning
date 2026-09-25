@@ -141,8 +141,8 @@ def plot3d(d, title="3D plot", color=None):
 
 
 
-class FFNN(nn.Module):
-    def __init__(self, structure, activation=nn.ReLU(), activation_last_layer=None):
+class MLP(nn.Module):
+    def __init__(self, structure, activation=nn.ReLU(), activation_last_layer=None): 
         super().__init__()
         layers = []
         for i in range(len(structure) - 1):
