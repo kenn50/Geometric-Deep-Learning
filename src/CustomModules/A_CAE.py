@@ -44,6 +44,21 @@ class CAE(nn.Module):
             self.add_module(f"encoder_{chart_index}", MLP([input_dim] + hidden_structure + [z_dim], activation=activation))
             self.add_module(f"decoder_{chart_index}", MLP([z_dim] + hidden_structure + [input_dim], activation=activation))
 
+    def true_predict(self, x):
+        network = self
+        data = x
+        device = x.device
+        errors = torch.zeros((len(data),network.chart_amount), device=device) # (chart_amount, d)
+        for i in range(network.chart_amount):
+            z = network.encode(data, i)
+            decoded= network.decode(z, i) # (bs, D)
+            errors[:, i] = norm_squared(decoded, data, dim=1)
+
+        probs = F.softmax(-errors.detach(), dim=1)
+        return probs
+
+
+ 
     def predict(self, x):
         logits = self.chart_predictor(x)
         probabililties = F.softmax(logits, dim=1)
@@ -125,7 +140,7 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
             
             
             l1 = torch.min(errors, dim=1).values * 10000
-            loss =  l1 - torch.gather(log_probs, 1, torch.argmin(errors, dim=1).unsqueeze(1))  + autoencoder_loss
+            loss =  l1 - torch.sum(target_probs * log_probs, dim=1)  + autoencoder_loss
             loss = loss.mean()
             loss.backward()
             optimizer.step()
