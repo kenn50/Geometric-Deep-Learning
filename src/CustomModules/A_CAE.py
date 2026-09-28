@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm, trange
+from sklearn.neighbors import NearestNeighbors
 
 from CustomModules.util import *
 
@@ -48,6 +49,20 @@ class CAE(nn.Module):
         logits = self.chart_predictor(x)
         probabililties = F.softmax(logits, dim=1)
         return probabililties
+    
+    def true_predict(self, x):
+        errors = torch.zeros((len(x),self.chart_amount), device=x.device)
+        
+        for i in range(self.chart_amount):
+            z = self.encode(x, i)
+            decoded = self.decode(z, i) # (bs, D)
+            errors[:, i] = norm_squared(decoded, x, dim=1)
+        
+        probabililties = F.softmax(-errors.detach(), dim=1)
+        return probabililties
+        
+         
+        
 
     def encode(self, x, chart_index):
         #if autoencoder is available, we use it first:
@@ -76,9 +91,12 @@ class CAE(nn.Module):
 
 
     
-def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device, lr=1e-3):
-    #x= torch.tensor(farthest_point_sample(x_train, k=network.chart_amount)[0], dtype=torch.float32) # (chart_amount, m)
-    kmeans = KMeans(n_clusters=network.chart_amount, random_state=np.random.randint(0, 1000), n_init="auto").fit(x_train)
+def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device, knn = 100, lr=1e-3):
+    furthest_points = farthest_point_sample(x_train, k=network.chart_amount)[0] # (chart_amount, m)
+    nbs = NearestNeighbors(n_neighbors=knn, algorithm='ball_tree').fit(x_train)
+    
+    #kmeans = KMeans(n_clusters=network.chart_amount, random_state=np.random.randint(0, 1000), n_init="auto").fit(x_train)
+    
     x_train = x_train.to(device)
     network = network.to(device)
     optimizer = torch.optim.Adam(network.parameters(), lr=lr)
@@ -86,7 +104,10 @@ def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device,
         optimizer.zero_grad()
         loss = 0
         for i in range(network.chart_amount):
-            x_sliced = x_train[kmeans.labels_ == i]
+            distances, indices = nbs.kneighbors(furthest_points[i].reshape(1, -1))
+            x_sliced = x_train[indices.flatten()]
+            #x_sliced = x_train[kmeans.labels_ == i]
+            
             z = network.encode(x_sliced, i)
             x_recon = network.decode(z, i) # 1, m)
             loss += F.mse_loss(x_recon, x_sliced) - torch.log(network.predict(x_sliced  + 1e-8)[:, i]).mean()

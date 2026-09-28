@@ -10,7 +10,7 @@ import threading
 import webbrowser
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Sequence
+from typing import Callable, Sequence
 from urllib.parse import urlparse
 
 
@@ -46,6 +46,7 @@ class ViserSplitView:
         host: str = "127.0.0.1",
         port: int = 8082,
         min_pane_width_px: int = 180,
+        on_request: Callable[[str], tuple[str, bytes] | None] | None = None,
     ) -> None:
         if len(views) < 2:
             raise ValueError("ViserSplitView requires at least two views.")
@@ -64,6 +65,7 @@ class ViserSplitView:
         self.host = host
         self.port = port
         self.min_pane_width_px = min_pane_width_px
+        self.on_request = on_request
 
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -280,10 +282,21 @@ class ViserSplitView:
             return self.url
 
         page = self._make_html()
+        on_request = self.on_request
 
         class WrapperHandler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 if self.path not in ("/", "/index.html"):
+                    response = on_request(self.path) if on_request else None
+                    if response is not None:
+                        content_type, body = response
+                        self.send_response(200)
+                        self.send_header("Content-Type", content_type)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.send_header("Cache-Control", "no-store")
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
                     self.send_error(404)
                     return
 
