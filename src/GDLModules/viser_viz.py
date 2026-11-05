@@ -126,6 +126,32 @@ def _chart_colors(count: int) -> np.ndarray:
     return np.rint(np.asarray(colors) * 255).astype(np.uint8)
 
 
+def _add_coordinate_labels(
+    scene: viser.SceneApi, root: str, extent: float, *, latent: bool = False,
+) -> None:
+    """Label coordinate axes at major grid intervals in native data units."""
+    offset = 0.06 * extent
+    for axis, name in enumerate(("x", "y") if latent else ("x", "y", "z")):
+        position = [0.0, 0.0, 0.0]
+        position[axis] = 1.12 * extent
+        scene.add_label(
+            f"{root}/{name}_label", f"{'latent ' if latent else ''}{name}",
+            position=tuple(position),
+        )
+        for index in range(-3, 4):
+            # Show the origin once, shared by all axes.
+            if index == 0 and axis != 0:
+                continue
+            value = index * (extent / 3)
+            position = [-offset, -offset, 0.02 * extent]
+            position[axis] = value
+            scene.add_label(
+                f"{root}/grid_numbers/{name}_{index}", f"{value:.3g}",
+                position=tuple(position), font_size_mode="screen",
+                font_screen_scale=0.8, depth_test=False,
+            )
+
+
 def _numpy_points(points: np.ndarray | torch.Tensor) -> np.ndarray:
     if isinstance(points, torch.Tensor):
         points = points.detach().cpu().numpy()
@@ -261,6 +287,8 @@ def open_split_view(
     contains the encodings of input points whose reconstruction error on that
     chart is at most ``epsilon``. ``observation_opacity`` controls the alpha
     of the colored x-space cloud. Precomputation may take time for large clouds.
+    Numeric axis labels show each space's native coordinate units at major
+    grid intervals.
     """
     points = _numpy_points(x_point_cloud)
     if not isinstance(cae, torch.nn.Module):
@@ -340,12 +368,7 @@ def open_split_view(
             "/latent/grid", width=2 * latent_extent, height=2 * latent_extent,
             plane="xy", cell_size=latent_extent / 6, section_size=latent_extent / 3,
         )
-        latent_server.scene.add_label(
-            "/latent/x_label", "latent x", position=(latent_extent, 0, 0.02)
-        )
-        latent_server.scene.add_label(
-            "/latent/y_label", "latent y", position=(0, latent_extent, 0.02)
-        )
+        _add_coordinate_labels(latent_server.scene, "/latent", latent_extent, latent=True)
         latent_server.initial_camera.position = (0, 0, max(3 * latent_extent, 3))
         latent_server.initial_camera.look_at = (0, 0, 0)
         latent_server.initial_camera.up = (0, 1, 0)
@@ -354,6 +377,7 @@ def open_split_view(
             "/x/grid", width=2 * x_extent, height=2 * x_extent, plane="xy",
             cell_size=x_extent / 6, section_size=x_extent / 3,
         )
+        _add_coordinate_labels(x_server.scene, "/x", x_extent)
         # Viser point clouds have RGB colors but no opacity control. Small
         # Gaussian splats give the observation cloud real alpha blending.
         sigma = max(point_size * 0.5, x_extent * 0.003)

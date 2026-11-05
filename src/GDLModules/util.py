@@ -145,15 +145,20 @@ def plot3d(d, title="3D plot", color=None):
 
 
 class MLP(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_structure, activation=nn.ReLU(), activation_last_layer=None): 
+    def __init__(self, input_dim, output_dim, hidden_structure, activation=nn.ReLU(), activation_last_layer=None, normalize=False): 
         super().__init__()
+        def linear_layer(in_dim, out_dim):
+            if normalize:
+                return nn.utils.parametrizations.spectral_norm(nn.Linear(in_dim, out_dim))
+            return nn.Linear(in_dim, out_dim)
+        
         layers = []
-        layers.append(nn.Linear(input_dim, hidden_structure[0]))
+        layers.append(linear_layer(input_dim, hidden_structure[0]))
         layers.append(activation)
         for i in range(len(hidden_structure) - 1):
-            layers.append(nn.Linear(hidden_structure[i], hidden_structure[i + 1]))
+            layers.append(linear_layer(hidden_structure[i], hidden_structure[i + 1]))
             layers.append(activation)
-        layers.append(nn.Linear(hidden_structure[-1], output_dim))
+        layers.append(linear_layer(hidden_structure[-1], output_dim))
         if activation_last_layer is not None:
             layers.append(activation_last_layer)
         self.network = nn.Sequential(*layers)
