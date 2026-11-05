@@ -124,8 +124,9 @@ def get_lipschitz_loss(module_list, device):
 
     
 def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device, knn = 100, lr=1e-3):
-    furthest_points = farthest_point_sample(x_train, k=network.chart_amount)[0] # (chart_amount, m)
-    nbs = NearestNeighbors(n_neighbors=knn, algorithm='ball_tree').fit(x_train)
+    furthest_points = farthest_point_sample(x_train.cpu().detach().numpy(), k=network.chart_amount)[0] # (chart_amount, D)
+    nbs = NearestNeighbors(n_neighbors=knn, algorithm='ball_tree').fit(x_train.cpu().detach().numpy())
+
     
     #kmeans = KMeans(n_clusters=network.chart_amount, random_state=np.random.randint(0, 1000), n_init="auto").fit(x_train)
     
@@ -140,15 +141,19 @@ def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device,
             x_sliced = x_train[indices.flatten()]
             #x_sliced = x_train[kmeans.labels_ == i]
             
-            z = network.encode(x_sliced, i)
+            # Generate 1000 points normally disttribured around furthest_points[i]. The normal distrubtuion should be a z_dim dimensional manifold with a random rotation
+            center = torch.as_tensor(furthest_points[i], device=device, dtype=x_train.dtype)
+            x_normal = center + 0.1 * torch.randn((len(x_sliced), network.z_dim), device=device, dtype=x_train.dtype) @ torch.randn((network.z_dim, network.x_dim), device=device, dtype=x_train.dtype)
+            
+            z = network.encode(x_normal, i)
             x_recon = network.decode(z, i) # 1, m)
-            loss += F.mse_loss(x_recon, x_sliced)
+            loss += F.mse_loss(x_recon, x_normal)
 
 
         loss.backward()
         optimizer.step()
 
-def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device: torch.device, lr=1e-4, best_k=1, mmd_weight=0.0, lipschitz_weight=0.0):
+def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device: torch.device, lr=1e-4, best_k=1, mmd_weight=0.0, lipschitz_weight=0.0, stop_event=None):
     network.to(device)
     optimizer = torch.optim.Adam(network.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=100)
@@ -161,6 +166,9 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
     
     
     for epoch in pbar:
+        if stop_event is not None and stop_event.is_set():
+            print("Training stopped.")
+            break
         for batch in x_train_loader:
             
             batch = batch.to(device)

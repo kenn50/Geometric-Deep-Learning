@@ -137,7 +137,7 @@ def plot3d(d, title="3D plot", color=None):
         ),
     )
 
-    fig.show()
+    return fig
     
     
 
