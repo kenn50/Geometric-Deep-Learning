@@ -145,17 +145,48 @@ def plot3d(d, title="3D plot", color=None):
 
 
 class MLP(nn.Module):
-    def __init__(self, structure, activation=nn.ReLU(), activation_last_layer=None): 
+    def __init__(self, input_dim, output_dim, hidden_structure, activation=nn.ReLU(), activation_last_layer=None): 
         super().__init__()
         layers = []
-        for i in range(len(structure) - 1):
-            layers.append(nn.Linear(structure[i], structure[i + 1]))
-            if i < len(structure) - 2:  # No activation after the last layer
-                layers.append(activation)
-        self.network = nn.Sequential(*layers)
-
+        layers.append(nn.Linear(input_dim, hidden_structure[0]))
+        layers.append(activation)
+        for i in range(len(hidden_structure) - 1):
+            layers.append(nn.Linear(hidden_structure[i], hidden_structure[i + 1]))
+            layers.append(activation)
+        layers.append(nn.Linear(hidden_structure[-1], output_dim))
         if activation_last_layer is not None:
-            self.network.append(activation_last_layer)
+            layers.append(activation_last_layer)
+        self.network = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.network(x)
+    
+    
+
+
+
+def batched_rbf(x, y, sigma = 1):
+    return torch.exp(-torch.cdist(x, y)**2/(2*sigma**2))
+
+def MMD_score(x, y, kernel = batched_rbf):
+    xn = len(x)
+    yn = len(y)
+
+    
+    xx = torch.sum(kernel(x, x))/(xn*xn)
+    yy = torch.sum(kernel(y, y))/(yn*yn)
+    xy = torch.sum(kernel(x, y))/(xn*yn)
+    
+    
+    return xx + yy - 2*xy
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    

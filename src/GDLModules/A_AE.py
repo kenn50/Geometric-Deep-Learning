@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from GDLModules.util import *
 from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm, trange
 
-from CustomModules.util import farthest_point_sample
+from GDLModules.util import farthest_point_sample
 
 class AE(nn.Module):
     def __init__(self, m, d, hidden_dim):
@@ -48,6 +49,24 @@ def train_ae(num_epochs: int, x_train_loader: DataLoader, network: AE, device: t
             optimizer.step()
     return
 
+
+
+
+def train_wae(num_epochs: int, x_train_loader: DataLoader, network: AE, device: torch.device, mmd_weight: float = 1.0):
+    network.to(device)
+    diag = []
+    optimizer = torch.optim.Adam(network.parameters(), lr=0.001)
+    for epoch in trange(num_epochs):
+        for batch in x_train_loader:
+            
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            z = network.encode(batch) 
+            recon = network.decode(z) 
+            loss = F.mse_loss(recon, batch) + mmd_weight * MMD_score(z, torch.randn_like(z))  #
+            loss.backward()
+            optimizer.step()
+    return
 
 
 

@@ -6,7 +6,7 @@ import numpy as np
 from tqdm import tqdm, trange
 from sklearn.neighbors import NearestNeighbors
 
-from CustomModules.util import *
+from GDLModules.util import *
 
 
 from sklearn.cluster import KMeans
@@ -36,14 +36,14 @@ class CAE(nn.Module):
         self.z_dim = z_dim # chart space dimension
         self.activation_inner = activation
 
-        self.chart_predictor = MLP([x_dim] + predictor_structure + [chart_amount], activation=activation)
+        self.chart_predictor = MLP(x_dim, chart_amount, predictor_structure, activation=activation)
 
         input_dim = x_dim if not autoencoder else autoencoder.z_dim
 
 
         for chart_index in range(chart_amount):
-            self.add_module(f"encoder_{chart_index}", MLP([input_dim] + hidden_structure + [z_dim], activation=activation))
-            self.add_module(f"decoder_{chart_index}", MLP([z_dim] + hidden_structure + [input_dim], activation=activation))
+            self.add_module(f"encoder_{chart_index}", MLP(input_dim, z_dim, hidden_structure, activation=activation))
+            self.add_module(f"decoder_{chart_index}", MLP(z_dim, input_dim, hidden_structure, activation=activation))
 
     def true_predict(self, x):
         network = self
@@ -131,12 +131,15 @@ def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device,
         loss.backward()
         optimizer.step()
 
-def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device: torch.device, lr=1e-4):
+def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device: torch.device, lr=1e-4, mmd_weight=1.0):
     network.to(device)
     diag = []
     optimizer = torch.optim.Adam(network.parameters(), lr=lr)
     pbar = trange(num_epochs)
 
+    losses = torch.zeros((10,))
+    losses_index = 0
+    
     for epoch in pbar:
         for batch in x_train_loader:
             
@@ -148,25 +151,50 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
             #     decoded = network.autoencoder.decode(z_middle) # (bs, D)
             #     autoencoder_loss = F.mse_loss(decoded, batch)
             errors = torch.zeros((len(batch),network.chart_amount), device=device) # (chart_amount, d)
+            zs = torch.zeros((len(batch), network.chart_amount, network.z_dim), device=device) # (chart_amount, d, z_dim)
             regularization_loss = 0
+            mmd_loss = 0
             for i in range(network.chart_amount):
-                z = network.encode(batch, i)
+                z = network.encode(batch, i) # (bs, z_dim)
                 decoded = network.decode(z, i) # (bs, D)
                 errors[:, i] = norm_squared(decoded, batch, dim=1)
+                
+                zs[:, i, :] = z
+
+                    
+
+           
 
             target_probs = F.softmax(-errors.detach(), dim=1)
             
+            
+            
             predicted_probs = network.predict(batch) # (bs, chart_amount)
             log_probs = torch.log(predicted_probs + 1e-8) # (bs, chart_amount)
+
+            k1 = torch.kthvalue(errors, 1, dim=1)[0] # (bs,)
+            k2 = torch.kthvalue(errors, 2, dim=1)[0]
+            index = torch.concat([k1.unsqueeze(1), k2.unsqueeze(1)], dim=1) # (bs, 2)
+            index = index.unsqueeze(-1).expand(-1, -1, zs.size(2)) # (bs, 2, z_dim)
+            
+            index = index.long()
+            
+            mmd_input = zs.gather(dim=1, index=index).reshape(-1, zs.size(2)) # (bs*2, z_dim)
+            mmd_loss = MMD_score(mmd_input, torch.randn_like(mmd_input)) # (bs*2, z_dim)
             
             
-            l1 = torch.min(errors, dim=1).values * 10000
-            loss =  l1 - torch.sum(target_probs * log_probs, dim=1)  + autoencoder_loss
+
+            
+            l1 = k1[0] + k2[0] # (bs,)
+            loss =  l1 - torch.sum(target_probs * log_probs, dim=1)  + autoencoder_loss + mmd_weight * mmd_loss  # (bs,)
             loss = loss.mean()
             loss.backward()
             optimizer.step()
+            
+            losses[losses_index] = loss.item()
+            losses_index = (losses_index + 1) % len(losses)
 
-            pbar.set_postfix(loss=f"{l1.mean().item():.4f}")
+            pbar.set_postfix(loss=f"{losses.mean().item():.4f}")
 
 
             diag.append((torch.min(errors, dim=1).values, - torch.sum(target_probs * log_probs, dim=1), autoencoder_loss, regularization_loss))

@@ -2,7 +2,7 @@
 
 Example::
 
-    from CustomModules.viser_viz import open_split_view
+    from GDModules.viser_viz import open_split_view
 
     viewer = open_split_view(X_train, cae)
     # The browser opens at viewer.url. Call viewer.stop() when finished.
@@ -35,7 +35,7 @@ import numpy as np
 import torch
 import viser
 
-from CustomModules.viser_split_view import SceneView, ViserSplitView
+from GDLModules.viser_split_view import SceneView, ViserSplitView
 
 
 _CHART_CONTROLS_HTML = """
