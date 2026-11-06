@@ -178,8 +178,8 @@ def MMD_score(x, y, kernel = batched_rbf):
     yn = len(y)
 
     
-    xx = torch.sum(kernel(x, x))/(xn*xn)
-    yy = torch.sum(kernel(y, y))/(yn*yn)
+    xx = torch.sum(kernel(x, x))/(xn*(xn-1))
+    yy = torch.sum(kernel(y, y))/(yn*(yn-1))
     xy = torch.sum(kernel(x, y))/(xn*yn)
     
     

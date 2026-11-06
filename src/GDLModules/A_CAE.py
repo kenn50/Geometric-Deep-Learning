@@ -143,7 +143,7 @@ def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device,
             
             # Generate 1000 points normally disttribured around furthest_points[i]. The normal distrubtuion should be a z_dim dimensional manifold with a random rotation
             center = torch.as_tensor(furthest_points[i], device=device, dtype=x_train.dtype)
-            x_normal = center + 0.1 * torch.randn((len(x_sliced), network.z_dim), device=device, dtype=x_train.dtype) @ torch.randn((network.z_dim, network.x_dim), device=device, dtype=x_train.dtype)
+            x_normal = center + 0.5 * torch.randn((len(x_sliced), network.x_dim), device=device, dtype=x_train.dtype)
             
             z = network.encode(x_normal, i)
             x_recon = network.decode(z, i) # 1, m)
@@ -153,7 +153,7 @@ def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device,
         loss.backward()
         optimizer.step()
 
-def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device: torch.device, lr=1e-4, best_k=1, mmd_weight=0.0, lipschitz_weight=0.0, stop_event=None):
+def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device: torch.device, lr=1e-4, best_k=1, mmd_weight=0.0, lipschitz_weight=0.0, stop_event=None, threshold=5e-2):
     network.to(device)
     optimizer = torch.optim.Adam(network.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=100)
@@ -183,18 +183,33 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
                 
                 zs[:, i, :] = z
 
-            best_errors, best_chart_indices = errors.topk(k=best_k, dim=1, largest=False) # (bs, k), (bs, k)
+
+
+            kevins_unsummed_loss = nn.functional.relu(threshold - errors) # (bs, chart_amount)
+
+            # if two charts or more are both > 0 on a point, remove the reward entirely for that point
+            kevins_usummed_punish_loss = kevins_unsummed_loss.clone()
+            kevins_usummed_punish_loss[kevins_usummed_punish_loss.gt(0).sum(dim=1) > 1] = 0
+            
+            kevins_loss = kevins_unsummed_loss.sum()
+            
+
 
             chart_losses = []
             for i in range(network.chart_amount):
-                assigned = (best_chart_indices == i).any(dim=1)
-                if assigned.any():
-                    z_i = zs[assigned, i, :]
-                    chart_losses.append(MMD_score(z_i, torch.randn_like(z_i)))
+                #for every point > 0, get the index
+                column = kevins_unsummed_loss[:, i]
+                gt0 = column.gt(0)
+                if gt0.any():
+                    rewarded_points = zs[gt0, i] # (bs, z_dim)
+                    chart_losses.append(MMD_score(rewarded_points, torch.randn_like(rewarded_points)))
 
             mmd_loss = torch.stack(chart_losses).mean()
+            
 
-            l1 = best_errors.sum(dim=1)
+
+            
+            l1 = -kevins_loss
             
             
             loss =  l1  + mmd_weight * mmd_loss + lipschitz_weight * get_lipschitz_loss(network.encoders, device)   # (bs,)
@@ -206,7 +221,7 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
             losses[losses_index] = loss.item()
             losses_index = (losses_index + 1) % len(losses)
 
-            pbar.set_postfix(rec_loss=f"{100*l1.mean().item():.4f}%", loss=f"{100*losses.mean().item():.4f}%", lr=f"{optimizer.param_groups[0]['lr']:.6f}")
+            pbar.set_postfix(rec_loss=f"{100*l1.mean().item():.4f}%",mmd_loss=f"{100*mmd_loss.item():.4f}%", loss=f"{100*losses.mean().item():.4f}%", lr=f"{optimizer.param_groups[0]['lr']:.6f}")
 
 
 
