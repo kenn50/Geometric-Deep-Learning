@@ -6,8 +6,9 @@ import numpy as np
 from tqdm import tqdm, trange
 from sklearn.neighbors import NearestNeighbors
 
-
+from GDLModules.util import sample_uniform_ball_like, MMD_score
 from GDLModules.util import *
+
 
 
 from sklearn.cluster import KMeans
@@ -143,7 +144,7 @@ def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device,
             
             # Generate 1000 points normally disttribured around furthest_points[i]. The normal distrubtuion should be a z_dim dimensional manifold with a random rotation
             center = torch.as_tensor(furthest_points[i], device=device, dtype=x_train.dtype)
-            x_normal = center + 0.5 * torch.randn((len(x_sliced), network.x_dim), device=device, dtype=x_train.dtype)
+            x_normal = center + 0.1 * torch.randn((len(x_sliced), network.x_dim), device=device, dtype=x_train.dtype)
             
             z = network.encode(x_normal, i)
             x_recon = network.decode(z, i) # 1, m)
@@ -191,7 +192,7 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
             kevins_usummed_punish_loss = kevins_unsummed_loss.clone()
             kevins_usummed_punish_loss[kevins_usummed_punish_loss.gt(0).sum(dim=1) > 1] = 0
             
-            kevins_loss = kevins_unsummed_loss.sum()
+            kevins_loss = kevins_unsummed_loss.sum(dim=1)
             
 
 
@@ -202,7 +203,8 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
                 gt0 = column.gt(0)
                 if gt0.any():
                     rewarded_points = zs[gt0, i] # (bs, z_dim)
-                    chart_losses.append(MMD_score(rewarded_points, torch.randn_like(rewarded_points)))
+                    target = sample_uniform_ball_like(rewarded_points, radius=1.0)
+                    chart_losses.append(MMD_score(rewarded_points, target))
 
             mmd_loss = torch.stack(chart_losses).mean()
             

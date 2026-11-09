@@ -168,23 +168,38 @@ class MLP(nn.Module):
     
     
 
+#Made by gpt 6.1 sol
+def sample_uniform_ball_like(z, radius=1.0):
+    directions = torch.randn_like(z)
+    directions = directions / directions.norm(
+        dim=1, keepdim=True
+    ).clamp_min(1e-12)
+
+    d = z.shape[1]
+    radii = torch.rand(
+        (len(z), 1), device=z.device, dtype=z.dtype
+    ).pow(1.0 / d)
+
+    return radius * radii * directions
 
 
 def batched_rbf(x, y, sigma = 1):
     return torch.exp(-torch.cdist(x, y)**2/(2*sigma**2))
 
-def MMD_score(x, y, kernel = batched_rbf):
-    xn = len(x)
-    yn = len(y)
 
-    
-    xx = torch.sum(kernel(x, x))/(xn*(xn-1))
-    yy = torch.sum(kernel(y, y))/(yn*(yn-1))
-    xy = torch.sum(kernel(x, y))/(xn*yn)
-    
-    
-    return xx + yy - 2*xy
-    
+def multiscale_rbf(x, y, sigmas=(0.2, 0.5, 1.0, 2.0, 5.0)):
+    return sum(
+        batched_rbf(x, y, sigma=sigma)
+        for sigma in sigmas
+    ) / len(sigmas)
+
+
+def MMD_score(x, y, kernel=multiscale_rbf):
+    return (
+        kernel(x, x).mean()
+        + kernel(y, y).mean()
+        - 2 * kernel(x, y).mean()
+    )
     
     
     
