@@ -1,0 +1,357 @@
+# %% [markdown]
+# # Sinkhorn with four learned surface patches
+#
+# Four independent decoders map uniform 2D squares into R^3. Each update draws
+# 128 fresh latent points per chart, concatenates all 512 decoded points, and
+# compares that combined cloud to 512 torus points with one GeomLoss Sinkhorn
+# divergence. There are no separate per-patch losses or target assignments.
+#
+# Run the cells in order. The last cell opens a browser replay with four latent
+# squares, all decoded patches, the target torus, and a fixed-probe loss curve.
+# Each chart has a consistent color in latent and decoded space; the legend
+# can hide individual patches.
+
+# %% Imports
+from dataclasses import dataclass
+from pathlib import Path
+from time import perf_counter
+import math
+
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import torch
+from torch import nn
+from geomloss import SamplesLoss
+from tqdm.auto import trange
+
+# Reuse the surface-area-uniform torus sampler from the original experiment.
+try:
+    from experiments.sinkhorn import sample_torus
+except ModuleNotFoundError as error:
+    if error.name != "experiments":
+        raise
+    from sinkhorn import sample_torus
+
+
+# %% Settings
+N_PATCHES = 4
+PATCH_COLORS = ("#0072B2", "#D55E00", "#009E73", "#CC79A7")
+
+
+@dataclass
+class Settings:
+    seed: int = 7
+    steps: int = 2000
+    points_per_patch: int = 128  # 4 * 128 = 512 decoded points per update.
+    learning_rate: float = 1e-3
+    hidden_width: int = 128
+    blur: float = 0.05
+    scaling: float = 0.8
+    target_points: int = 4096
+    display_points_per_patch: int = 1024
+    probe_points_per_patch: int = 128
+    record_every: int = 40
+    major_radius: float = 1.0
+    minor_radius: float = 0.35
+    square_half_width: float = 1.0
+    initial_patch_scale: float = 0.5
+    initial_center_scale: float = 0.45
+
+
+# %% Four independent 2D -> 3D decoders
+def sample_latents(count_per_patch, half_width=1.0, *, device="cpu", generator=None):
+    return half_width * (
+        2 * torch.rand(N_PATCHES, count_per_patch, 2, device=device, generator=generator) - 1
+    )
+
+
+class PatchDecoder(nn.Module):
+    """A learnable affine plane plus a plain nonlinear MLP deformation."""
+
+    def __init__(self, center, width=128, initial_scale=0.5):
+        super().__init__()
+        self.affine = nn.Linear(2, 3)
+        self.residual = nn.Sequential(
+            nn.Linear(2, width), nn.SiLU(),
+            nn.Linear(width, width), nn.SiLU(),
+            nn.Linear(width, width), nn.SiLU(),
+            nn.Linear(width, 3),
+        )
+        # Different generic plane orientations break symmetry between patches.
+        # This initialization contains no torus parameterization.
+        basis, _ = torch.linalg.qr(torch.randn(3, 2), mode="reduced")
+        with torch.no_grad():
+            self.affine.weight.copy_(initial_scale * basis)
+            self.affine.bias.copy_(center)
+        nn.init.normal_(self.residual[-1].weight, std=1e-3)
+        nn.init.zeros_(self.residual[-1].bias)
+
+    def forward(self, z):
+        return self.affine(z) + self.residual(z)
+
+
+class PatchDecoders(nn.Module):
+    def __init__(self, width=128, initial_scale=0.5, center_scale=0.45):
+        super().__init__()
+        # Four separated starting locations at the vertices of a tetrahedron.
+        centers = center_scale * torch.tensor(
+            [[-1., -1., -1.], [-1., 1., 1.], [1., -1., 1.], [1., 1., -1.]]
+        )
+        self.decoders = nn.ModuleList([
+            PatchDecoder(center, width, initial_scale) for center in centers
+        ])
+
+    def forward(self, z):
+        # z: (4, points_per_patch, 2) -> combined: (4 * points_per_patch, 3).
+        return torch.cat([
+            decoder(z[chart]) for chart, decoder in enumerate(self.decoders)
+        ], dim=0)
+
+
+# %% Training -- one Sinkhorn loss on the concatenated point cloud
+@dataclass
+class Snapshot:
+    step: int
+    seconds: float
+    loss: float
+    points: np.ndarray  # (4, display_points_per_patch, 3).
+
+
+@dataclass
+class Experiment:
+    model: PatchDecoders
+    latent: np.ndarray  # (4, display_points_per_patch, 2).
+    target: np.ndarray
+    history: list[Snapshot]
+    settings: Settings
+    device: str
+
+
+def train_experiment(settings=None, *, device=None, progress=True):
+    settings = settings or Settings()
+    counts = (settings.points_per_patch, settings.display_points_per_patch,
+              settings.probe_points_per_patch, settings.target_points,
+              settings.hidden_width, settings.record_every)
+    if settings.steps < 0 or any(value < 1 for value in counts):
+        raise ValueError("steps must be nonnegative; point counts and record_every must be positive.")
+    if settings.square_half_width <= 0 or settings.blur <= 0 or not 0 < settings.scaling < 1:
+        raise ValueError("Require positive square_half_width and blur, and 0 < scaling < 1.")
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    torch.manual_seed(settings.seed)
+    train_rng = torch.Generator(device=device).manual_seed(settings.seed + 1)
+    display_rng = torch.Generator(device=device).manual_seed(settings.seed + 2)
+    probe_rng = torch.Generator(device=device).manual_seed(settings.seed + 3)
+
+    model = PatchDecoders(
+        settings.hidden_width, settings.initial_patch_scale, settings.initial_center_scale
+    ).to(device)
+    criterion = SamplesLoss(
+        loss="sinkhorn", p=2, blur=settings.blur, scaling=settings.scaling,
+        debias=True, backend="tensorized",
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=settings.learning_rate)
+    target = sample_torus(
+        settings.target_points, settings.major_radius, settings.minor_radius,
+        device=device, generator=train_rng,
+    )
+    latent = sample_latents(
+        settings.display_points_per_patch, settings.square_half_width,
+        device=device, generator=display_rng,
+    )
+    probe_z = sample_latents(
+        settings.probe_points_per_patch, settings.square_half_width,
+        device=device, generator=probe_rng,
+    )
+    probe_target = sample_torus(
+        N_PATCHES * settings.probe_points_per_patch,
+        settings.major_radius, settings.minor_radius,
+        device=device, generator=probe_rng,
+    )
+    history = []
+    started = perf_counter()
+
+    @torch.no_grad()
+    def record(step):
+        output = model(latent).detach().reshape(N_PATCHES, -1, 3).cpu().numpy().copy()
+        probe_output = model(probe_z)
+        value = criterion(probe_output, probe_target).detach().item()
+        if not math.isfinite(value) or not np.isfinite(output).all():
+            raise FloatingPointError("Non-finite loss or decoded points; reduce learning_rate.")
+        history.append(Snapshot(step, perf_counter() - started, value, output))
+
+    record(0)
+    last_step = 0
+    steps = trange(1, settings.steps + 1, desc="Sinkhorn patches", disable=not progress)
+    try:
+        for step in steps:
+            z = sample_latents(
+                settings.points_per_patch, settings.square_half_width,
+                device=device, generator=train_rng,
+            )
+            # Each decoder contributes 128 points; the union has 512 points.
+            decoded = model(z)
+            indices = torch.randint(len(target), (len(decoded),), device=device, generator=train_rng)
+            optimizer.zero_grad(set_to_none=True)
+            loss = criterion(decoded, target[indices])
+            if not torch.isfinite(loss).item():
+                raise FloatingPointError("Non-finite training loss; reduce learning_rate.")
+            loss.backward()
+            optimizer.step()
+            last_step = step
+            if step % settings.record_every == 0 or step == settings.steps:
+                record(step)
+                steps.set_postfix(probe_loss=f"{history[-1].loss:.5f}")
+    except KeyboardInterrupt:
+        print("Training interrupted; keeping recorded snapshots and the model.")
+    finally:
+        steps.close()
+    if history[-1].step != last_step:
+        record(last_step)
+    return Experiment(
+        model, latent.cpu().numpy(), target.cpu().numpy(), history, settings, str(device)
+    )
+
+
+# %% Interactive replay
+def make_history_plot(experiment):
+    history, settings = experiment.history, experiment.settings
+    if not history:
+        raise ValueError("No snapshots were recorded.")
+    figure = make_subplots(
+        rows=2, cols=3,
+        specs=[[{"type": "xy"}, {"type": "scene"}, {"type": "scene"}],
+               [{"type": "xy", "colspan": 3}, None, None]],
+        row_heights=[0.78, 0.22], vertical_spacing=0.12,
+        subplot_titles=["Four 2D latent squares", "Combined decoder output", "Target torus",
+                        "Sinkhorn divergence on fixed held-out probe points"],
+    )
+    half = settings.square_half_width
+    spacing = 1.3 * half
+    offsets = np.array([[-spacing, spacing], [spacing, spacing],
+                        [-spacing, -spacing], [spacing, -spacing]])
+
+    # Traces 0..3: latent charts, shifted apart only for display.
+    for chart, (u, v) in enumerate(offsets):
+        z = experiment.latent[chart]
+        figure.add_trace(go.Scattergl(
+            x=z[:, 0] + u, y=z[:, 1] + v, mode="markers",
+            name=f"Patch {chart + 1}", legendgroup=f"patch-{chart}", showlegend=False,
+            marker=dict(size=2, color=PATCH_COLORS[chart]), customdata=z,
+            hovertemplate=f"Patch {chart + 1}<br>u=%{{customdata[0]:.3f}}<br>v=%{{customdata[1]:.3f}}<extra></extra>",
+        ), row=1, col=1)
+        figure.add_shape(
+            type="rect", x0=u-half, x1=u+half, y0=v-half, y1=v+half,
+            line=dict(color=PATCH_COLORS[chart], width=1), row=1, col=1,
+        )
+        figure.add_annotation(x=u, y=v+1.13*half, text=f"Patch {chart + 1}",
+                              font=dict(color=PATCH_COLORS[chart]),
+                              showarrow=False, row=1, col=1)
+
+    # Traces 4..7: decoded charts. Legend clicks can toggle each patch.
+    for chart, points in enumerate(history[0].points):
+        figure.add_trace(go.Scatter3d(
+            x=points[:, 0], y=points[:, 1], z=points[:, 2], mode="markers",
+            marker=dict(size=2, color=PATCH_COLORS[chart]), name=f"Patch {chart + 1}",
+            legendgroup=f"patch-{chart}", showlegend=True,
+            hovertemplate=f"Patch {chart + 1}<br>(%{{x:.3f}}, %{{y:.3f}}, %{{z:.3f}})<extra></extra>",
+        ), row=1, col=2)
+
+    # Trace 8: target, displayed with the same marker size as generated points.
+    target = experiment.target[:N_PATCHES * settings.display_points_per_patch]
+    figure.add_trace(go.Scatter3d(
+        x=target[:, 0], y=target[:, 1], z=target[:, 2], mode="markers",
+        marker=dict(size=2, color="#555555"), hoverinfo="skip", showlegend=False,
+    ), row=1, col=3)
+    # Traces 9 and 10: loss history and the current replay position.
+    figure.add_trace(go.Scatter(
+        x=[s.step for s in history], y=[s.loss for s in history], mode="lines",
+        line=dict(color="#3465a4"), showlegend=False,
+    ), row=2, col=1)
+    figure.add_trace(go.Scatter(
+        x=[history[0].step], y=[history[0].loss], mode="markers",
+        marker=dict(color="red", size=10), showlegend=False,
+    ), row=2, col=1)
+
+    frames = []
+    for snapshot in history:
+        frames.append(go.Frame(
+            name=str(snapshot.step), traces=[4, 5, 6, 7, 10],
+            data=[go.Scatter3d(x=p[:, 0], y=p[:, 1], z=p[:, 2]) for p in snapshot.points]
+                 + [go.Scatter(x=[snapshot.step], y=[snapshot.loss])],
+            layout=go.Layout(title=dict(text=(
+                f"Four 2D patches -> torus | step {snapshot.step} | "
+                f"Sinkhorn {snapshot.loss:.5f} | {snapshot.seconds:.1f} s"
+            ))),
+        ))
+    figure.frames = frames
+    bound = 1.2 * max(
+        settings.major_radius + settings.minor_radius,
+        max(float(np.abs(snapshot.points).max()) for snapshot in history),
+    )
+    figure.update_scenes(
+        aspectmode="cube", dragmode="orbit", uirevision="patch-camera",
+        xaxis=dict(range=[-bound, bound], title="x"),
+        yaxis=dict(range=[-bound, bound], title="y"),
+        zaxis=dict(range=[-bound, bound], title="z"),
+        camera=dict(eye=dict(x=1.6, y=-2, z=1.2)),
+    )
+    figure.update_xaxes(range=[-2.6*half, 2.6*half], showticklabels=False, row=1, col=1)
+    figure.update_yaxes(range=[-2.6*half, 2.6*half], showticklabels=False,
+                        scaleanchor="x", scaleratio=1, row=1, col=1)
+    figure.update_xaxes(title_text="Training step", row=2, col=1)
+    figure.update_yaxes(title_text="Sinkhorn divergence", row=2, col=1)
+    figure.update_layout(
+        title=frames[0].layout.title, height=850,
+        margin=dict(l=50, r=40, t=120, b=130), uirevision="patch-camera",
+        legend=dict(orientation="h", x=0.35, y=1.08),
+        sliders=[dict(
+            active=0, x=0.13, len=0.87, y=-0.05,
+            currentvalue=dict(prefix="Training step: "),
+            steps=[dict(
+                method="animate", label=str(s.step), args=[[str(s.step)], dict(
+                    mode="immediate", frame=dict(duration=0, redraw=True), transition=dict(duration=0),
+                )],
+            ) for s in history],
+        )],
+        updatemenus=[dict(
+            type="buttons", direction="left", x=0, y=-0.05, showactive=False,
+            buttons=[
+                dict(label="Play", method="animate", args=[None, dict(
+                    fromcurrent=True, mode="immediate", frame=dict(duration=180, redraw=True),
+                    transition=dict(duration=0),
+                )]),
+                dict(label="Pause", method="animate", args=[[None], dict(
+                    mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0),
+                )]),
+            ],
+        )],
+    )
+    return figure
+
+
+# %% Run training
+if __name__ == "__main__":
+    settings = Settings()
+    experiment = train_experiment(settings)
+    model = experiment.model
+    decoders = model.decoders
+    history = experiment.history
+    print(f"Device: {experiment.device}; {N_PATCHES} independent 2D -> 3D decoders")
+    print(f"Training points: {settings.points_per_patch} per patch, {N_PATCHES * settings.points_per_patch} combined")
+    print(f"Fixed-probe Sinkhorn: {history[0].loss:.5f} -> {history[-1].loss:.5f}")
+
+
+# %% Save and open the replay
+if __name__ == "__main__":
+    fig = make_history_plot(experiment)
+    if "__file__" in globals():
+        root = Path(__file__).resolve().parents[1]
+    else:
+        root = next((p for p in (Path.cwd(), *Path.cwd().parents)
+                     if (p / "pyproject.toml").exists()), Path.cwd())
+    html_path = root / "reports" / "sinkhorn_patches.html"
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(html_path, include_plotlyjs=True, auto_play=False)
+    print(f"Saved interactive history: {html_path}")
+    fig.show(renderer="browser", auto_play=False)
