@@ -1,3 +1,4 @@
+# Created by GPT 6.1 Sol
 # %% [markdown]
 # # Sinkhorn: decoding a uniform 3D cube into a torus
 #

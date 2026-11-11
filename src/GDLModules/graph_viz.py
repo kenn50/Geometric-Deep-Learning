@@ -1,3 +1,5 @@
+#Created by GPT 6.1 Sol
+
 """Browser-based comparison and expansion of radius and kNN graphs."""
 
 import asyncio
@@ -42,8 +44,12 @@ def _edge_coordinates(points, rows, columns):
     return segments.reshape(-1, 3)
 
 
-def _neighbor_graph(index, kind, value):
-    """Build a symmetric, loop-free graph without creating plot geometry."""
+def _neighbor_graph(index: NearestNeighbors, kind, value):
+    """Build a SciPy CSR graph using a fitted sklearn NearestNeighbors object.
+
+    ``index`` is the reusable neighbor-search object, not a point's integer ID.
+    Its radius_neighbors_graph / kneighbors_graph methods construct the edges.
+    """
     if kind == "radius":
         graph = index.radius_neighbors_graph(radius=value, mode="connectivity")
     else:
@@ -161,7 +167,8 @@ class GraphExplorer:
         self._trace_nodes = {}
         self.search_results = {}
         self._search_running = False
-        self._index = NearestNeighbors(algorithm="kd_tree", n_jobs=1).fit(points)
+        # Fit sklearn's neighbor search once; reuse it for every radius/k query.
+        self._neighbor_search = NearestNeighbors(algorithm="kd_tree", n_jobs=1).fit(points)
 
         self.radius = pn.widgets.FloatSlider(
             name="Radius", start=min(0.005, radius), end=max(0.2, radius),
@@ -297,7 +304,7 @@ class GraphExplorer:
         try:
             self.error.visible = False
             if graph is None:
-                graph = _neighbor_graph(self._index, kind, value)
+                graph = _neighbor_graph(self._neighbor_search, kind, value)
             self.graphs[kind] = graph
             self._graph_values[kind] = value
             self._expansion_cache.pop(kind, None)
@@ -344,13 +351,13 @@ class GraphExplorer:
         if kind == "radius":
             if not np.isfinite(beta) or beta < 0:
                 raise ValueError("Radius buffer beta must be finite and nonnegative.")
-            result = find_connected_radius(self._index, initial_value, tolerance)
+            result = find_connected_radius(self._neighbor_search, initial_value, tolerance)
             applied = result.value * (1 + beta)
             if not np.isfinite(applied):
                 raise ValueError("The buffered radius is not finite.")
-            graph = result.graph if applied == result.value else _neighbor_graph(self._index, kind, applied)
+            graph = result.graph if applied == result.value else _neighbor_graph(self._neighbor_search, kind, applied)
         else:
-            result = find_connected_k(self._index, initial_value)
+            result = find_connected_k(self._neighbor_search, initial_value)
             applied, graph = result.value, result.graph
         return result, applied, graph
 

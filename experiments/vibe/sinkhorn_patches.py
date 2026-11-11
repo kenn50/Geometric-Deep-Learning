@@ -1,12 +1,15 @@
+# Created by GPT 6.1 Sol
 # %% [markdown]
-# # Sinkhorn with four learned surface patches
+# # Sinkhorn with eight learned surface patches
 #
-# Four independent decoders map uniform 2D squares into R^3. Each update draws
-# 128 fresh latent points per chart, concatenates all 512 decoded points, and
-# compares that combined cloud to 512 torus points with one GeomLoss Sinkhorn
-# divergence. There are no separate per-patch losses or target assignments.
+# Eight independent decoders map uniform 2D squares into R^3. Each update draws
+# 128 fresh latent points per chart, concatenates all 1024 decoded points, and
+# compares that combined cloud to 1024 torus points with one GeomLoss Sinkhorn
+# divergence. A Jacobian penalty pushes both singular values of each decoder
+# toward one positive learnable scale S shared by all charts at the sampled
+# latent points. There are no per-patch target assignments.
 #
-# Run the cells in order. The last cell opens a browser replay with four latent
+# Run the cells in order. The last cell opens a browser replay with eight latent
 # squares, all decoded patches, the target torus, and a fixed-probe loss curve.
 # Each chart has a consistent color in latent and decoded space; the legend
 # can hide individual patches.
@@ -27,29 +30,34 @@ from tqdm.auto import trange
 
 # Reuse the surface-area-uniform torus sampler from the original experiment.
 try:
-    from experiments.sinkhorn import sample_torus
+    from experiments.vibe.sinkhorn import sample_torus
 except ModuleNotFoundError as error:
-    if error.name != "experiments":
+    if error.name not in ("experiments", "experiments.vibe"):
         raise
     from sinkhorn import sample_torus
 
 
 # %% Settings
-N_PATCHES = 4
-PATCH_COLORS = ("#0072B2", "#D55E00", "#009E73", "#CC79A7")
+N_PATCHES = 8
+PATCH_COLORS = (
+    "#0072B2", "#D55E00", "#009E73", "#CC79A7",
+    "#E69F00", "#56B4E9", "#7A5195", "#555555",
+)
 
 
 @dataclass
 class Settings:
     seed: int = 7
     steps: int = 2000
-    points_per_patch: int = 128  # 4 * 128 = 512 decoded points per update.
+    points_per_patch: int = 128  # 8 * 128 = 1024 decoded points per update.
     learning_rate: float = 1e-3
+    jacobian_weight: float = 1.0  # Weight of mean((singular_values(J) - S)**2); 0 disables it.
+    initial_singular_scale: float = 1.0  # Initial S, learned jointly across all charts.
     hidden_width: int = 128
     blur: float = 0.05
     scaling: float = 0.8
     target_points: int = 4096
-    display_points_per_patch: int = 1024
+    display_points_per_patch: int = 5000
     probe_points_per_patch: int = 128
     record_every: int = 40
     major_radius: float = 1.0
@@ -59,7 +67,7 @@ class Settings:
     initial_center_scale: float = 0.45
 
 
-# %% Four independent 2D -> 3D decoders
+# %% Eight independent 2D -> 3D decoders
 def sample_latents(count_per_patch, half_width=1.0, *, device="cpu", generator=None):
     return half_width * (
         2 * torch.rand(N_PATCHES, count_per_patch, 2, device=device, generator=generator) - 1
@@ -92,36 +100,64 @@ class PatchDecoder(nn.Module):
 
 
 class PatchDecoders(nn.Module):
-    def __init__(self, width=128, initial_scale=0.5, center_scale=0.45):
+    def __init__(self, width=128, initial_scale=0.5, center_scale=0.45,
+                 initial_singular_scale=1.0):
         super().__init__()
-        # Four separated starting locations at the vertices of a tetrahedron.
+        if not math.isfinite(initial_singular_scale) or initial_singular_scale <= 0:
+            raise ValueError("initial_singular_scale must be finite and positive.")
+        # A single scalar parameter belongs to the whole atlas, not each decoder.
+        self.log_singular_scale = nn.Parameter(torch.tensor(math.log(initial_singular_scale)))
+        # Eight separated starting locations at the vertices of a cube.
         centers = center_scale * torch.tensor(
-            [[-1., -1., -1.], [-1., 1., 1.], [1., -1., 1.], [1., 1., -1.]]
+            [[x, y, z] for x in (-1., 1.) for y in (-1., 1.) for z in (-1., 1.)]
         )
         self.decoders = nn.ModuleList([
             PatchDecoder(center, width, initial_scale) for center in centers
         ])
 
+    @property
+    def singular_scale(self):
+        """Shared positive target S for both singular values of every chart."""
+        return self.log_singular_scale.exp()
+
     def forward(self, z):
-        # z: (4, points_per_patch, 2) -> combined: (4 * points_per_patch, 3).
+        # z: (N_PATCHES, points_per_patch, 2) -> combined: (N_PATCHES * points_per_patch, 3).
         return torch.cat([
             decoder(z[chart]) for chart, decoder in enumerate(self.decoders)
         ], dim=0)
 
 
-# %% Training -- one Sinkhorn loss on the concatenated point cloud
+def jacobian_isometry_loss(decoded, z, singular_scale):
+    """Mean squared deviation of per-point Jacobian singular values from shared S.
+
+    Each decoder processes points independently, so differentiating a sum of
+    output coordinates gives the corresponding Jacobian row at every point.
+    create_graph=True allows the penalty to backpropagate into decoder weights.
+    """
+    rows = [
+        torch.autograd.grad(
+            decoded[:, coordinate].sum(), z, create_graph=True,
+        )[0]
+        for coordinate in range(3)
+    ]
+    jacobian = torch.stack(rows, dim=-2)  # (N_PATCHES, points_per_patch, 3, 2).
+    singular_values = torch.linalg.svdvals(jacobian)
+    return (singular_values - singular_scale).square().mean()
+
+
+# %% Training -- combined Sinkhorn loss plus local Jacobian regularization
 @dataclass
 class Snapshot:
     step: int
     seconds: float
     loss: float
-    points: np.ndarray  # (4, display_points_per_patch, 3).
+    points: np.ndarray  # (N_PATCHES, display_points_per_patch, 3).
 
 
 @dataclass
 class Experiment:
     model: PatchDecoders
-    latent: np.ndarray  # (4, display_points_per_patch, 2).
+    latent: np.ndarray  # (N_PATCHES, display_points_per_patch, 2).
     target: np.ndarray
     history: list[Snapshot]
     settings: Settings
@@ -137,6 +173,8 @@ def train_experiment(settings=None, *, device=None, progress=True):
         raise ValueError("steps must be nonnegative; point counts and record_every must be positive.")
     if settings.square_half_width <= 0 or settings.blur <= 0 or not 0 < settings.scaling < 1:
         raise ValueError("Require positive square_half_width and blur, and 0 < scaling < 1.")
+    if not math.isfinite(settings.jacobian_weight) or settings.jacobian_weight < 0:
+        raise ValueError("jacobian_weight must be finite and nonnegative.")
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.manual_seed(settings.seed)
     train_rng = torch.Generator(device=device).manual_seed(settings.seed + 1)
@@ -144,7 +182,8 @@ def train_experiment(settings=None, *, device=None, progress=True):
     probe_rng = torch.Generator(device=device).manual_seed(settings.seed + 3)
 
     model = PatchDecoders(
-        settings.hidden_width, settings.initial_patch_scale, settings.initial_center_scale
+        settings.hidden_width, settings.initial_patch_scale, settings.initial_center_scale,
+        initial_singular_scale=settings.initial_singular_scale,
     ).to(device)
     criterion = SamplesLoss(
         loss="sinkhorn", p=2, blur=settings.blur, scaling=settings.scaling,
@@ -189,11 +228,17 @@ def train_experiment(settings=None, *, device=None, progress=True):
                 settings.points_per_patch, settings.square_half_width,
                 device=device, generator=train_rng,
             )
-            # Each decoder contributes 128 points; the union has 512 points.
+            z.requires_grad_(settings.jacobian_weight > 0)
+            # Each decoder contributes points_per_patch points to the combined cloud.
             decoded = model(z)
             indices = torch.randint(len(target), (len(decoded),), device=device, generator=train_rng)
             optimizer.zero_grad(set_to_none=True)
-            loss = criterion(decoded, target[indices])
+            sinkhorn_loss = criterion(decoded, target[indices])
+            jacobian_loss = (
+                jacobian_isometry_loss(decoded, z, model.singular_scale)
+                if settings.jacobian_weight > 0 else decoded.new_zeros(())
+            )
+            loss = sinkhorn_loss + settings.jacobian_weight * jacobian_loss
             if not torch.isfinite(loss).item():
                 raise FloatingPointError("Non-finite training loss; reduce learning_rate.")
             loss.backward()
@@ -201,7 +246,11 @@ def train_experiment(settings=None, *, device=None, progress=True):
             last_step = step
             if step % settings.record_every == 0 or step == settings.steps:
                 record(step)
-                steps.set_postfix(probe_loss=f"{history[-1].loss:.5f}")
+                steps.set_postfix(
+                    probe_loss=f"{history[-1].loss:.5f}",
+                    jacobian_loss=f"{jacobian_loss.detach().item():.5f}",
+                    S=f"{model.singular_scale.detach().item():.5f}",
+                )
     except KeyboardInterrupt:
         print("Training interrupted; keeping recorded snapshots and the model.")
     finally:
@@ -223,15 +272,20 @@ def make_history_plot(experiment):
         specs=[[{"type": "xy"}, {"type": "scene"}, {"type": "scene"}],
                [{"type": "xy", "colspan": 3}, None, None]],
         row_heights=[0.78, 0.22], vertical_spacing=0.12,
-        subplot_titles=["Four 2D latent squares", "Combined decoder output", "Target torus",
+        subplot_titles=[f"{N_PATCHES} 2D latent squares", "Combined decoder output", "Target torus",
                         "Sinkhorn divergence on fixed held-out probe points"],
     )
     half = settings.square_half_width
     spacing = 1.3 * half
-    offsets = np.array([[-spacing, spacing], [spacing, spacing],
-                        [-spacing, -spacing], [spacing, -spacing]])
+    columns = 4
+    rows = math.ceil(N_PATCHES / columns)
+    offsets = np.array([
+        [(2 * (chart % columns) - (columns - 1)) * spacing,
+         ((rows - 1) - 2 * (chart // columns)) * spacing]
+        for chart in range(N_PATCHES)
+    ])
 
-    # Traces 0..3: latent charts, shifted apart only for display.
+    # First N_PATCHES traces: latent charts, shifted apart only for display.
     for chart, (u, v) in enumerate(offsets):
         z = experiment.latent[chart]
         figure.add_trace(go.Scattergl(
@@ -248,7 +302,7 @@ def make_history_plot(experiment):
                               font=dict(color=PATCH_COLORS[chart]),
                               showarrow=False, row=1, col=1)
 
-    # Traces 4..7: decoded charts. Legend clicks can toggle each patch.
+    # Next N_PATCHES traces: decoded charts. Legend clicks can toggle each patch.
     for chart, points in enumerate(history[0].points):
         figure.add_trace(go.Scatter3d(
             x=points[:, 0], y=points[:, 1], z=points[:, 2], mode="markers",
@@ -257,13 +311,13 @@ def make_history_plot(experiment):
             hovertemplate=f"Patch {chart + 1}<br>(%{{x:.3f}}, %{{y:.3f}}, %{{z:.3f}})<extra></extra>",
         ), row=1, col=2)
 
-    # Trace 8: target, displayed with the same marker size as generated points.
+    # Target, displayed with the same marker size as generated points.
     target = experiment.target[:N_PATCHES * settings.display_points_per_patch]
     figure.add_trace(go.Scatter3d(
         x=target[:, 0], y=target[:, 1], z=target[:, 2], mode="markers",
         marker=dict(size=2, color="#555555"), hoverinfo="skip", showlegend=False,
     ), row=1, col=3)
-    # Traces 9 and 10: loss history and the current replay position.
+    # Loss history and the current replay position follow the target trace.
     figure.add_trace(go.Scatter(
         x=[s.step for s in history], y=[s.loss for s in history], mode="lines",
         line=dict(color="#3465a4"), showlegend=False,
@@ -276,11 +330,12 @@ def make_history_plot(experiment):
     frames = []
     for snapshot in history:
         frames.append(go.Frame(
-            name=str(snapshot.step), traces=[4, 5, 6, 7, 10],
+            name=str(snapshot.step),
+            traces=[*range(N_PATCHES, 2 * N_PATCHES), 2 * N_PATCHES + 2],
             data=[go.Scatter3d(x=p[:, 0], y=p[:, 1], z=p[:, 2]) for p in snapshot.points]
                  + [go.Scatter(x=[snapshot.step], y=[snapshot.loss])],
             layout=go.Layout(title=dict(text=(
-                f"Four 2D patches -> torus | step {snapshot.step} | "
+                f"{N_PATCHES} 2D patches -> torus | step {snapshot.step} | "
                 f"Sinkhorn {snapshot.loss:.5f} | {snapshot.seconds:.1f} s"
             ))),
         ))
@@ -296,8 +351,8 @@ def make_history_plot(experiment):
         zaxis=dict(range=[-bound, bound], title="z"),
         camera=dict(eye=dict(x=1.6, y=-2, z=1.2)),
     )
-    figure.update_xaxes(range=[-2.6*half, 2.6*half], showticklabels=False, row=1, col=1)
-    figure.update_yaxes(range=[-2.6*half, 2.6*half], showticklabels=False,
+    figure.update_xaxes(range=[-columns*spacing, columns*spacing], showticklabels=False, row=1, col=1)
+    figure.update_yaxes(range=[-rows*spacing, rows*spacing], showticklabels=False,
                         scaleanchor="x", scaleratio=1, row=1, col=1)
     figure.update_xaxes(title_text="Training step", row=2, col=1)
     figure.update_yaxes(title_text="Sinkhorn divergence", row=2, col=1)
@@ -340,13 +395,14 @@ if __name__ == "__main__":
     print(f"Device: {experiment.device}; {N_PATCHES} independent 2D -> 3D decoders")
     print(f"Training points: {settings.points_per_patch} per patch, {N_PATCHES * settings.points_per_patch} combined")
     print(f"Fixed-probe Sinkhorn: {history[0].loss:.5f} -> {history[-1].loss:.5f}")
+    print(f"Learned shared singular scale S: {model.singular_scale.detach().item():.5f}")
 
 
 # %% Save and open the replay
 if __name__ == "__main__":
     fig = make_history_plot(experiment)
     if "__file__" in globals():
-        root = Path(__file__).resolve().parents[1]
+        root = Path(__file__).resolve().parents[2]
     else:
         root = next((p for p in (Path.cwd(), *Path.cwd().parents)
                      if (p / "pyproject.toml").exists()), Path.cwd())
@@ -355,3 +411,5 @@ if __name__ == "__main__":
     fig.write_html(html_path, include_plotlyjs=True, auto_play=False)
     print(f"Saved interactive history: {html_path}")
     fig.show(renderer="browser", auto_play=False)
+
+# %%
