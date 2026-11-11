@@ -53,6 +53,17 @@ def generate_torus(num_points, R=1.0, r=0.3):
     data = np.apply_along_axis(f, 1, uv)
     return data
 
+def generate_quarter_torus(num_points, R=1.0, r=0.3):
+    uv = np.random.rand(num_points, 2) * 2*np.pi
+    def f(row):
+        u,v = row
+        return np.array([np.cos(u) * (R + r*np.cos(v)), np.abs(np.sin(u) * (R + r*np.cos(v))), np.abs(r*np.sin(v))])
+
+    data = np.apply_along_axis(f, 1, uv)
+    return data
+
+
+
 
 def norm_squared(x, y, dim):
     return torch.sum((x - y) ** 2, dim=dim)
@@ -72,6 +83,7 @@ def plot3d(d, title="3D plot", color=None):
     """
 
     fig = go.Figure()
+    
 
     if color is None:
         color = [None] * len(d)
@@ -81,10 +93,11 @@ def plot3d(d, title="3D plot", color=None):
             f"Expected {len(d)} color specifications, got {len(color)}."
         )
 
-    for (dataset, label), c in zip(d, color):
-        points = np.asarray(dataset).reshape(-1, 3)
+    for d_tuple, c in zip(d, color):
+        points = np.asarray(d_tuple[0]).reshape(-1, 3)
 
         marker = dict(size=2)
+
 
         if c is not None:
             if isinstance(c, str):
@@ -97,7 +110,7 @@ def plot3d(d, title="3D plot", color=None):
 
                 if len(c) != len(points):
                     raise ValueError(
-                        f"Color array for '{label}' has {len(c)} values, "
+                        f"Color array for '{d_tuple[1]}' has {len(c)} values, "
                         f"but dataset has {len(points)} points."
                     )
 
@@ -108,14 +121,22 @@ def plot3d(d, title="3D plot", color=None):
                     colorbar=dict(title="Alpha"),
                 )
 
+
+
+        mode = "markers"
+        if(len(d_tuple)>= 3):
+            mode=d_tuple[2]
+        
+
         fig.add_trace(
-            go.Scatter3d(
+                go.Scatter3d(
                 x=points[:, 0],
                 y=points[:, 1],
                 z=points[:, 2],
-                mode="markers",
-                name=label,
+                mode=mode,
+                name=d_tuple[1],
                 marker=marker,
+                line=dict(width=8),
             )
         )
 
@@ -142,7 +163,13 @@ def plot3d(d, title="3D plot", color=None):
     
 
 
+class Sum(nn.Module):
+    def __init__(self, *models):
+        super().__init__()
+        self.models = nn.ModuleList(models)
 
+    def forward(self, x):
+        return sum(model(x) for model in self.models)
 
 class MLP(nn.Module):
     def __init__(self, input_dim, output_dim, hidden_structure, activation=nn.ReLU(), activation_last_layer=None, normalize=False): 

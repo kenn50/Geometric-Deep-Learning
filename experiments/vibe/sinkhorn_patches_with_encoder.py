@@ -331,14 +331,12 @@ def train_experiment(settings=None, *, device=None, progress=True):
                 if settings.encoder_weight > 0 else decoded.new_zeros(())
             )
             reconstruction_active = step > settings.steps // 2
-            real_reconstruction_loss = (
-                reconstruction_loss(model, real_points)
-                if reconstruction_active and settings.reconstruction_weight > 0
-                else decoded.new_zeros(())
+            loss = (
+                sinkhorn_loss + settings.encoder_weight * encoder_loss
+                if reconstruction_active
+                else (sinkhorn_loss + settings.jacobian_weight * jacobian_loss
+                    + settings.encoder_weight * encoder_loss)
             )
-            loss = (sinkhorn_loss + settings.jacobian_weight * jacobian_loss
-                    + settings.encoder_weight * encoder_loss
-                    + settings.reconstruction_weight * real_reconstruction_loss)
             if not torch.isfinite(loss).item():
                 raise FloatingPointError("Non-finite training loss; reduce learning_rate.")
             loss.backward()
@@ -532,8 +530,13 @@ if __name__ == "__main__":
                      if (p / "pyproject.toml").exists()), Path.cwd())
     html_path = root / "reports" / "sinkhorn_patches_with_encoder.html"
     html_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_html(html_path, include_plotlyjs=True, auto_play=False)
-    print(f"Saved interactive history: {html_path}")
-    fig.show(renderer="browser", auto_play=False)
+fig.write_html(
+    html_path,
+    include_plotlyjs=True,
+    full_html=True,
+    auto_play=False,
+    auto_open=True,
+)
+print(f"Saved interactive history: {html_path.resolve()}")
 
 # %%
