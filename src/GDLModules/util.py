@@ -61,7 +61,28 @@ def generate_quarter_torus(num_points, R=1.0, r=0.3):
 
     data = np.apply_along_axis(f, 1, uv)
     return data
+def generate_parabola_surface(num_points, R=3.0, width=1, depth=1, angle = 0.5):
+    uv = np.random.rand(num_points, 2) 
 
+
+    def x(s):
+        val = width * (s/np.sqrt(1+4*s**2))
+        return val
+    def y(s):
+        val = ((s**2)/np.sqrt(1+4*s**2))
+        return val
+
+    def f(row):
+        u,v = row
+
+        u *= (6.28 * angle)
+        v = 2 * depth * (v-0.5)
+
+
+        return np.array([np.cos(u) * (R + x(v)), np.sin(u) * (R + x(v)), y(v)])
+
+    data = np.apply_along_axis(f, 1, uv)
+    return data
 
 
 
