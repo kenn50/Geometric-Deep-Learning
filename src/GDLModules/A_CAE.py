@@ -9,11 +9,12 @@ from sklearn.neighbors import NearestNeighbors
 from GDLModules.util import sample_uniform_ball_like, MMD_score
 from GDLModules.util import *
 
-
+from geomloss import SamplesLoss
 
 from sklearn.cluster import KMeans
 import numpy as np
 
+from torch.func import jacfwd
 
 
 
@@ -81,7 +82,7 @@ class CAE(nn.Module):
     
     def decode(self, z, chart_indexes):
         chart_indexes = torch.tensor(chart_indexes, device=z.device)
-
+        
         if chart_indexes.ndim == 0:
             recon = self.decoders[chart_indexes.item()](z)
         else:
@@ -99,20 +100,20 @@ def get_lipschitz_loss(module_list, device):
     
     #Count layers
     num_layers = 0
-    for module in module_list:
-        for layer in module.network:
+    for chart_module in module_list:
+        for layer in chart_module.network:
             if isinstance(layer, nn.Linear):
                 num_layers+=1
     
     m = torch.zeros((num_charts, num_layers), device=device)
     
-    for i, module in enumerate(module_list):
-            j = 0
-            for layer in module.network:
+    for chart_index, chart_module in enumerate(module_list):
+            layer_index = 0
+            for layer in chart_module.network:
                 if isinstance(layer, nn.Linear):
-                    m[i, j] = torch.log(torch.linalg.matrix_norm(layer.weight, ord=2))
+                    m[chart_index, layer_index] = torch.log(torch.linalg.matrix_norm(layer.weight, ord=2))
                     
-                    j+=1
+                    layer_index+=1
           
 
     products = torch.abs(1-torch.exp(torch.sum(m, dim=1)))
@@ -153,6 +154,26 @@ def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device,
 
         loss.backward()
         optimizer.step()
+
+
+
+
+
+
+def get_jacobian(f, points, return_function_output = False):
+    in_f = f
+    if return_function_output:
+        def double_f(x):
+            out = f(x)
+            return out, out
+        in_f = double_f
+    
+    return torch.vmap(jacfwd(in_f, has_aux=return_function_output))(points)
+    
+
+
+
+
 
 def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device: torch.device, lr=1e-4, best_k=1, mmd_weight=0.0, lipschitz_weight=0.0, stop_event=None, threshold=5e-2):
     network.to(device)
@@ -229,4 +250,54 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
 
 
 
+
+
+
+def reverse_train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device: torch.device, lr=1e-4, lipschitz_weight=0.0, stop_event=None):
     
+    criterion = SamplesLoss(
+        loss="sinkhorn", p=2, blur=0.05, scaling=0.8, backend="tensorized", debias=True
+    )
+    network.to(device)
+    optimizer = torch.optim.Adam(network.parameters(), lr=lr)
+    pbar = trange(num_epochs)
+    x_train = x_train.to(device)
+    x_train_loader = DataLoader(x_train, batch_size=512, shuffle=True)
+    for epoch in pbar:
+        if stop_event is not None and stop_event.is_set():
+            print("Training stopped.")
+            break
+        for batch in x_train_loader:
+            # sample 1000 points
+            optimizer.zero_grad()
+            z_sample = torch.rand(512, network.z_dim).to(device)
+            encoder_loss = 0
+            decoded_lst = []
+            for i in range(network.chart_amount):
+                x_decoded = network.decode(z_sample, i)
+                decoded_lst.append(x_decoded)
+                J, z_encoded = get_jacobian(lambda points: network.encode(points, i), x_decoded, return_function_output=True)
+                svdvals = torch.linalg.svdvals(J)
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                encoder_loss += F.mse_loss(z_encoded, z_sample)
+                
+            
+            decoded = torch.vstack(decoded_lst)
+            loss = criterion(decoded, batch) + encoder_loss + lipschitz_weight * get_lipschitz_loss(network.encoders, device=device)
+            pbar.set_postfix({"loss": loss.item()})
+            loss.backward()
+            optimizer.step()
+    return
+
+def detect_problem_area():
+    pass
+
+
