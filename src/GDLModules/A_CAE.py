@@ -6,7 +6,7 @@ import numpy as np
 from tqdm import tqdm, trange
 from sklearn.neighbors import NearestNeighbors
 
-from GDLModules.util import sample_uniform_ball_like, MMD_score
+from GDLModules.util import sample_uniform_ball_like, MMD_score, ChamferLoss
 from GDLModules.util import *
 
 from geomloss import SamplesLoss
@@ -15,9 +15,44 @@ from sklearn.cluster import KMeans
 import numpy as np
 
 from torch.func import jacfwd
+from torch_pca import PCA as torchPCA
+from torch.nn.utils.parametrizations import orthogonal
 
 
 
+
+
+
+class Chart(nn.Module):
+    def __init__(self, x_dim, z_dim, hidden_structure, activation=nn.ReLU(), activation_last_layer=None):
+        super().__init__()
+        self.x_dim = x_dim
+        self.z_dim = z_dim
+        
+        self.encoder = MLP(x_dim, z_dim, hidden_structure, activation=activation, activation_last_layer=activation_last_layer)
+        self.decoder = MLP(z_dim, x_dim, hidden_structure, activation=activation, activation_last_layer=activation_last_layer, last_zero=True)
+        
+        self.affine_center = nn.Parameter(torch.randn(x_dim))
+        self.affine_linear = orthogonal(
+            nn.Linear(x_dim, x_dim, bias=False)
+        )
+    
+    
+    
+    def encode(self, x):
+        A = self.affine_linear.weight
+        x_d = (x - self.affine_center) @ A
+        return self.encoder(x_d)
+    
+    
+    def decode(self, z):
+        z_padded = F.pad(z, (0, self.x_dim - self.z_dim))
+        x_d = self.decoder(z) + z_padded
+
+        A = self.affine_linear.weight
+        return x_d @ A.T + self.affine_center
+    
+    
 
 class CAE(nn.Module):
     def __init__(self, x_dim, z_dim, hidden_structure, chart_amount, activation = nn.ReLU()):
@@ -32,29 +67,20 @@ class CAE(nn.Module):
         self.x_dim = x_dim # data dimension
         self.z_dim = z_dim # chart space dimension
         self.activation_inner = activation
+        self.hidden_structure = hidden_structure
 
-        input_dim = x_dim
         
-        self.encoders = nn.ModuleList([MLP(input_dim, z_dim, hidden_structure, activation=activation) for _ in range(chart_amount)])
-        self.decoders = nn.ModuleList([MLP(z_dim, input_dim, hidden_structure, activation=activation) for _ in range(chart_amount)])
-    
-
-    def true_predict(self, x):
-        network = self
-        data = x
-        device = x.device
-        errors = torch.zeros((len(data),network.chart_amount), device=device) # (chart_amount, d)
-        for i in range(network.chart_amount):
-            z = network.encode(data, i)
-            decoded= network.decode(z, i) # (bs, D)
-            errors[:, i] = norm_squared(decoded, data, dim=1)
-
-        probs = F.softmax(-errors.detach(), dim=1)
-        return probs
-
-
+        self.charts = nn.ModuleList([Chart(x_dim, z_dim, hidden_structure, activation=activation) for _ in range(chart_amount)])
 
     
+    
+    def new_chart(self, device):
+        new_chart = Chart(self.x_dim, self.z_dim, self.hidden_structure, activation=self.activation_inner).to(device)
+        self.charts.append(new_chart)
+        self.chart_amount += 1
+        return new_chart
+
+
     def true_predict(self, x):
         errors = torch.zeros((len(x),self.chart_amount), device=x.device)
         
@@ -70,13 +96,12 @@ class CAE(nn.Module):
         
 
     def encode(self, x, chart_index):
-        network_input = x
         chart_index = torch.tensor(chart_index, device=x.device)
 
         if chart_index.ndim == 0:
-            z = self.encoders[chart_index.item()](network_input)
+            z = self.charts[chart_index.item()].encode(x)
         else:
-            z = torch.stack([self.encoders[i](network_input[j]) for j, i in enumerate(chart_index)])
+            z = torch.stack([self.charts[i].encode(x[j]) for j, i in enumerate(chart_index)])
 
         return z
     
@@ -84,9 +109,9 @@ class CAE(nn.Module):
         chart_indexes = torch.tensor(chart_indexes, device=z.device)
         
         if chart_indexes.ndim == 0:
-            recon = self.decoders[chart_indexes.item()](z)
+            recon = self.charts[chart_indexes.item()].decode(z)
         else:
-            recon = torch.stack([self.decoders[i](z[j]) for j, i in enumerate(chart_indexes)])
+            recon = torch.stack([self.charts[i].decode(z[j]) for j, i in enumerate(chart_indexes)])
 
         x = recon
         return x
@@ -253,48 +278,112 @@ def train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device:
 
 
 
-def reverse_train_cae(num_epochs: int, x_train_loader: DataLoader, network: CAE, device: torch.device, lr=1e-4, lipschitz_weight=0.0, stop_event=None):
+def reverse_train_cae(num_epochs: int, x_train, network: CAE, device: torch.device, lr=1e-4, lipschitz_weight=0.0, norm_threshold = 2.0, stop_event=None, batch_size=512, spawn_interval=100, criterion_type="chamfer"):
     
-    criterion = SamplesLoss(
-        loss="sinkhorn", p=2, blur=0.05, scaling=0.8, backend="tensorized", debias=True
-    )
+    
+    
+    if criterion_type == "sinkhorn":
+        criterion = SamplesLoss(
+            loss="sinkhorn", p=2, blur=0.05, scaling=0.8, backend="tensorized", debias=True
+        )
+    elif criterion_type == "chamfer":
+        criterion = ChamferLoss()
+    else:
+        assert False, "Invalid criterion type"
+    
+    
     network.to(device)
     optimizer = torch.optim.Adam(network.parameters(), lr=lr)
     pbar = trange(num_epochs)
     x_train = x_train.to(device)
-    x_train_loader = DataLoader(x_train, batch_size=512, shuffle=True)
+    x_train_loader = DataLoader(x_train, batch_size=batch_size, shuffle=True)
     for epoch in pbar:
         if stop_event is not None and stop_event.is_set():
             print("Training stopped.")
             break
-        for batch in x_train_loader:
+         
+        for batch_idx, batch in enumerate(x_train_loader):
+            
+            
             # sample 1000 points
+            
             optimizer.zero_grad()
             z_sample = torch.rand(512, network.z_dim).to(device)
             encoder_loss = 0
+            svd_reg = 0
             decoded_lst = []
             for i in range(network.chart_amount):
-                x_decoded = network.decode(z_sample, i)
+                J, x_decoded = get_jacobian(network.charts[i].decode, z_sample, return_function_output=True)
                 decoded_lst.append(x_decoded)
-                J, z_encoded = get_jacobian(lambda points: network.encode(points, i), x_decoded, return_function_output=True)
-                svdvals = torch.linalg.svdvals(J)
                 
+                #penalize a large ratio
+                svdvals= torch.linalg.svdvals(J)
                 
+                svd_reg += (svdvals - 1).square().sum()
                 
-                
-                
-                
-                
-                
-                
+                #Reconstruction loss for encoder
+
+                z_encoded = network.charts[i].encode(x_decoded)
                 encoder_loss += F.mse_loss(z_encoded, z_sample)
                 
+    
             
             decoded = torch.vstack(decoded_lst)
-            loss = criterion(decoded, batch) + encoder_loss + lipschitz_weight * get_lipschitz_loss(network.encoders, device=device)
-            pbar.set_postfix({"loss": loss.item()})
+            loss = criterion(decoded, batch) + encoder_loss + lipschitz_weight*svd_reg
+            pbar.set_postfix(loss=loss.item(), chart_amount=network.chart_amount)
             loss.backward()
             optimizer.step()
+            
+            
+            # At the start of each epoch, spawn a new chart
+            
+            if batch_idx==0 and epoch % spawn_interval == 0 and epoch > 0:
+                print("spawning")
+                
+                with torch.no_grad():
+                    
+                    chart_scores = torch.zeros(len(batch), network.chart_amount, device=device)
+                    for i in range(network.chart_amount):
+
+                        J, z_encoded_batch = get_jacobian(network.charts[i].encode, batch, return_function_output=True)
+                        J_norm = torch.linalg.matrix_norm(J, ord=2) # (bs,)
+                        x_decoded_batch = network.decode(z_encoded_batch, i)
+                        mse = F.mse_loss(
+                            batch,
+                            x_decoded_batch,
+                            reduction="none"
+                        ).mean(dim=1)
+                        
+                        chart_scores[:, i] = J_norm + mse
+
+                    
+                    #find the points, which is handled worst by model
+                    chart_scores_best = chart_scores.min(dim=1).values
+                    worst_point_idx = torch.argmax(chart_scores_best)
+                    worst_point = batch[worst_point_idx].clone().detach()
+                    
+                    #spawn new chart at this point
+                    new_chart = network.new_chart(device)
+                    
+                    
+                    new_chart.affine_center.copy_(worst_point)
+                    
+                    dist = torch.norm(batch - worst_point, dim=1, p=None)
+                    knn = dist.topk(50, largest=False)
+                    pca = torchPCA(n_components=network.x_dim)
+                    pca.fit(batch[knn.indices])
+                    A = pca.components_.T
+                    
+                    new_chart.affine_linear.weight = A.to(device, dtype=new_chart.affine_linear.weight.dtype)
+                    
+                    
+                    optimizer.add_param_group({
+                        "params": new_chart.parameters()
+                    })
+                                        
+                    
+
+            
     return
 
 def detect_problem_area():

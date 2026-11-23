@@ -181,7 +181,33 @@ def plot3d(d, title="3D plot", color=None):
 
     return fig
     
-    
+
+
+
+#Created by ChatGPT 6.2 sol
+class ChamferLoss(nn.Module):
+    def forward(self, pred, target):
+        """
+        pred:   (B, N, D)
+        target: (B, M, D)
+        """
+        
+        
+        pred = pred.unsqueeze(0) if pred.dim() == 2 else pred
+        target = target.unsqueeze(0) if target.dim() == 2 else target
+        dist = torch.cdist(pred, target, p=2) ** 2
+
+
+        # Nearest neighbor in each direction
+        pred_to_target = dist.min(dim=2).values
+        target_to_pred = dist.min(dim=1).values
+
+        return (
+            pred_to_target.mean() +
+            target_to_pred.mean()
+        )
+
+
 
 
 class Sum(nn.Module):
@@ -193,20 +219,22 @@ class Sum(nn.Module):
         return sum(model(x) for model in self.models)
 
 class MLP(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_structure, activation=nn.ReLU(), activation_last_layer=None, normalize=False): 
+    def __init__(self, input_dim, output_dim, hidden_structure, activation=nn.ReLU(), activation_last_layer=None, last_zero=False): 
         super().__init__()
-        def linear_layer(in_dim, out_dim):
-            if normalize:
-                return nn.utils.parametrizations.spectral_norm(nn.Linear(in_dim, out_dim))
-            return nn.Linear(in_dim, out_dim)
-        
         layers = []
-        layers.append(linear_layer(input_dim, hidden_structure[0]))
+        layers.append(nn.Linear(input_dim, hidden_structure[0]))
         layers.append(activation)
         for i in range(len(hidden_structure) - 1):
-            layers.append(linear_layer(hidden_structure[i], hidden_structure[i + 1]))
+            layers.append(nn.Linear(hidden_structure[i], hidden_structure[i + 1]))
             layers.append(activation)
-        layers.append(linear_layer(hidden_structure[-1], output_dim))
+            
+        
+        last_linear = nn.Linear(hidden_structure[-1], output_dim)     
+        #initialize last layer weights to zero
+        if last_zero==True:
+            nn.init.normal_(last_linear.weight, std=1e-3)
+            nn.init.zeros_(last_linear.bias)
+        layers.append(last_linear)
         if activation_last_layer is not None:
             layers.append(activation_last_layer)
         self.network = nn.Sequential(*layers)
@@ -214,7 +242,41 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.network(x)
     
-    
+
+
+class MLP_CR(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_structure, activation=nn.ReLU(), activation_last_layer=None):
+        
+        super().__init__()
+        layers = []
+        layers.append(nn.Linear(input_dim, hidden_structure[0]))
+        layers.append(activation)
+        for i in range(len(hidden_structure) - 1):
+            layers.append(nn.Linear(hidden_structure[i], hidden_structure[i + 1]))
+            layers.append(activation)
+            
+        last_linear = nn.Linear(hidden_structure[-1], output_dim)
+        
+        #initialize last layer weights to zero
+        nn.init.zeros_(last_linear.weight + 1e-6)  
+        nn.init.zeros_(last_linear.bias + 1e-6)
+        layers.append(last_linear)
+        
+        if activation_last_layer is not None:
+            layers.append(activation_last_layer)
+        
+
+        self.network = nn.Sequential(*layers)
+
+        
+        self.center = nn.Parameter(torch.randn(output_dim))
+        self.rotate = nn.Linear(input_dim, output_dim, bias=False)
+
+    def forward(self, x):
+        return self.center + self.rotate(x) + self.network(x)
+
+
+
 
 #Made by gpt 6.1 sol
 def sample_uniform_ball_like(z, radius=1.0):
