@@ -372,7 +372,7 @@ def reverse_train_cae(num_epochs: int, x_train, network: CAE, device: torch.devi
                     knn = dist.topk(50, largest=False)
                     pca = torchPCA(n_components=network.x_dim)
                     pca.fit(batch[knn.indices])
-                    A = pca.components_.T
+                    A = pca.components_.T # Note that the pca returns pcs as rows, so we need to transpose it to get the correct shape
                     
                     new_chart.affine_linear.weight = A.to(device, dtype=new_chart.affine_linear.weight.dtype)
                     
