@@ -33,10 +33,8 @@ class Chart(nn.Module):
         self.encoder = MLP(x_dim, z_dim, hidden_structure, activation=activation, activation_last_layer=None, last_zero=True)
         self.decoder = MLP(z_dim, x_dim, hidden_structure, activation=activation, activation_last_layer=None, last_zero=True)
         
-        self.affine_center = nn.Parameter(torch.randn(x_dim))
-        self.affine_linear = orthogonal(
-            nn.Linear(x_dim, x_dim, bias=False)
-        )
+        self.register_buffer("affine_center", torch.zeros(x_dim))
+        self.register_buffer("affine_linear", torch.eye(x_dim))
         
         self.log_scale = nn.Parameter(torch.tensor(start_log_scale, dtype=torch.float32))
     
@@ -48,17 +46,17 @@ class Chart(nn.Module):
     
     
     def encode(self, x):
-        A = self.affine_linear.weight
+        A = self.affine_linear
         x_d = ((x - self.affine_center) @ A) / self.scale
 
         return x_d[..., :self.z_dim] + self.encoder(x_d)
-    
-    
+
+
     def decode(self, z):
         z_padded = F.pad(z, (0, self.x_dim - self.z_dim))
         x_d = self.decoder(z) + z_padded
 
-        A = self.affine_linear.weight
+        A = self.affine_linear
         return self.scale * (x_d @ A.T) + self.affine_center
     
     
@@ -69,8 +67,8 @@ class Chart(nn.Module):
             pca = torchPCA(n_components=self.x_dim)
             pca.fit(x)
 
-            self.affine_center.copy_(pca.mean_.squeeze(0))
-            self.affine_linear.weight = pca.components_.T
+            self.affine_center.copy_(pca.mean_.reshape(-1))
+            self.affine_linear.copy_(pca.components_.T)
     
     
 
