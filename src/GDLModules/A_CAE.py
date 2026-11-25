@@ -17,6 +17,7 @@ import numpy as np
 from torch.func import jacfwd
 from torch_pca import PCA as torchPCA
 from torch.nn.utils.parametrizations import orthogonal
+from typing import Literal
 
 
 
@@ -24,25 +25,33 @@ from torch.nn.utils.parametrizations import orthogonal
 
 
 class Chart(nn.Module):
-    def __init__(self, x_dim, z_dim, hidden_structure, activation=nn.ReLU(), activation_last_layer=None):
+    def __init__(self, x_dim, z_dim, hidden_structure, activation=nn.ReLU(), start_log_scale = -2):
         super().__init__()
         self.x_dim = x_dim
         self.z_dim = z_dim
         
-        self.encoder = MLP(x_dim, z_dim, hidden_structure, activation=activation, activation_last_layer=activation_last_layer)
-        self.decoder = MLP(z_dim, x_dim, hidden_structure, activation=activation, activation_last_layer=activation_last_layer, last_zero=True)
+        self.encoder = MLP(x_dim, z_dim, hidden_structure, activation=activation, activation_last_layer=None, last_zero=True)
+        self.decoder = MLP(z_dim, x_dim, hidden_structure, activation=activation, activation_last_layer=None, last_zero=True)
         
         self.affine_center = nn.Parameter(torch.randn(x_dim))
         self.affine_linear = orthogonal(
             nn.Linear(x_dim, x_dim, bias=False)
         )
+        
+        self.log_scale = nn.Parameter(torch.tensor(start_log_scale, dtype=torch.float32))
+    
+    
+    @property
+    def scale(self):
+        return self.log_scale.exp()
     
     
     
     def encode(self, x):
         A = self.affine_linear.weight
-        x_d = (x - self.affine_center) @ A
-        return self.encoder(x_d)
+        x_d = ((x - self.affine_center) @ A) / self.scale
+
+        return x_d[..., :self.z_dim] + self.encoder(x_d)
     
     
     def decode(self, z):
@@ -50,12 +59,23 @@ class Chart(nn.Module):
         x_d = self.decoder(z) + z_padded
 
         A = self.affine_linear.weight
-        return x_d @ A.T + self.affine_center
+        return self.scale * (x_d @ A.T) + self.affine_center
+    
+    
+    def init_pca(self, x):
+        with torch.no_grad():
+            x = x.to(self.affine_center)
+
+            pca = torchPCA(n_components=self.x_dim)
+            pca.fit(x)
+
+            self.affine_center.copy_(pca.mean_.squeeze(0))
+            self.affine_linear.weight = pca.components_.T
     
     
 
 class CAE(nn.Module):
-    def __init__(self, x_dim, z_dim, hidden_structure, chart_amount, activation = nn.ReLU()):
+    def __init__(self, x_dim, z_dim, hidden_structure, chart_amount, activation = nn.ReLU(), latent_dist : Literal["uniform", "normal", "ball"] = "uniform", start_log_scale =-2):
         """
         x_dim = data dimension
 
@@ -68,9 +88,10 @@ class CAE(nn.Module):
         self.z_dim = z_dim # chart space dimension
         self.activation_inner = activation
         self.hidden_structure = hidden_structure
+        self.latent_dist = latent_dist
 
         
-        self.charts = nn.ModuleList([Chart(x_dim, z_dim, hidden_structure, activation=activation) for _ in range(chart_amount)])
+        self.charts = nn.ModuleList([Chart(x_dim, z_dim, hidden_structure, activation=activation, start_log_scale=start_log_scale) for _ in range(chart_amount)])
 
     
     
@@ -91,9 +112,28 @@ class CAE(nn.Module):
         
         probabililties = F.softmax(-errors.detach(), dim=1)
         return probabililties
-        
-         
-        
+    
+    
+    
+    def sample_z(self, n=1):
+        param = next(self.parameters())
+        device, dtype = param.device, param.dtype
+        shape = (n, self.z_dim)
+
+        if self.latent_dist == "uniform":
+            return torch.rand(shape, device=device, dtype=dtype) * 2 - 1
+
+        elif self.latent_dist == "normal":
+            return torch.randn(shape, device=device, dtype=dtype)
+
+        elif self.latent_dist == "ball":
+            return sample_uniform_ball(
+                shape, radius=1.0, device=device, dtype=dtype
+            )
+
+        else:
+            raise ValueError(f"Unknown latent distribution: {self.latent_dist}")
+
 
     def encode(self, x, chart_index):
         chart_index = torch.tensor(chart_index, device=x.device)
@@ -160,6 +200,13 @@ def pre_train_cae(num_epochs: int, x_train, network : CAE, device: torch.device,
     x_train = x_train.to(device)
     network = network.to(device)
     optimizer = torch.optim.Adam(network.parameters(), lr=lr)
+    
+    for i in range(network.chart_amount):
+        distances, indices = nbs.kneighbors(furthest_points[i].reshape(1, -1))
+        x_sliced = x_train[indices.flatten()]
+        
+        network.charts[i].init_pca(x_sliced)
+    
     for epoch in trange(num_epochs):
         optimizer.zero_grad()
         loss = 0
@@ -297,6 +344,9 @@ def reverse_train_cae(num_epochs: int, x_train, network: CAE, device: torch.devi
     pbar = trange(num_epochs)
     x_train = x_train.to(device)
     x_train_loader = DataLoader(x_train, batch_size=batch_size, shuffle=True)
+    
+    
+    
     for epoch in pbar:
         if stop_event is not None and stop_event.is_set():
             print("Training stopped.")
@@ -304,29 +354,41 @@ def reverse_train_cae(num_epochs: int, x_train, network: CAE, device: torch.devi
          
         for batch_idx, batch in enumerate(x_train_loader):
             
-            
-            # sample 1000 points
+            #########################################
+            ############## TRAINING PART ############ 
+            #########################################
             
             optimizer.zero_grad()
-            z_sample = torch.rand(512, network.z_dim).to(device)
+            
             encoder_loss = 0
             svd_reg = 0
             decoded_lst = []
             for i in range(network.chart_amount):
+                z_sample = network.sample_z(n=len(batch)) # (bs, z_dim)
                 J, x_decoded = get_jacobian(network.charts[i].decode, z_sample, return_function_output=True)
                 decoded_lst.append(x_decoded)
                 
-                #penalize a large ratio
-                svdvals= torch.linalg.svdvals(J)
                 
-                svd_reg += (svdvals - 1).square().sum()
+                
+                # jacobian regulization, scale invariant
+                svdvals = torch.linalg.svdvals(J)  # (bs, z_dim)
+
+                scale = svdvals.mean()             # scalar per chart
+                normalized = svdvals / scale.clamp_min(1e-8)
+
+                svd_reg += (normalized - 1).square().mean()
                 
                 #Reconstruction loss for encoder
 
-                z_encoded = network.charts[i].encode(x_decoded)
+                z_encoded = network.charts[i].encode(x_decoded.detach()) # Deeouple the decoder from the encoder loss
                 encoder_loss += F.mse_loss(z_encoded, z_sample)
                 
-    
+
+            # Normalize the losses by the number of charts to avoid scaling issues when adding new charts
+            encoder_loss /= network.chart_amount
+            svd_reg /= network.chart_amount
+            
+            
             
             decoded = torch.vstack(decoded_lst)
             loss = criterion(decoded, batch) + encoder_loss + lipschitz_weight*svd_reg
@@ -335,7 +397,9 @@ def reverse_train_cae(num_epochs: int, x_train, network: CAE, device: torch.devi
             optimizer.step()
             
             
-            # At the start of each epoch, spawn a new chart
+            #########################################
+            ############# SPAWNING PART #############
+            #########################################
             
             if batch_idx==0 and epoch % spawn_interval == 0 and epoch > 0:
                 print("spawning")
@@ -370,12 +434,8 @@ def reverse_train_cae(num_epochs: int, x_train, network: CAE, device: torch.devi
                     
                     dist = torch.norm(batch - worst_point, dim=1, p=None)
                     knn = dist.topk(50, largest=False)
-                    pca = torchPCA(n_components=network.x_dim)
-                    pca.fit(batch[knn.indices])
-                    A = pca.components_.T # Note that the pca returns pcs as rows, so we need to transpose it to get the correct shape
                     
-                    new_chart.affine_linear.weight = A.to(device, dtype=new_chart.affine_linear.weight.dtype)
-                    
+                    new_chart.init_pca(batch[knn.indices])
                     
                     optimizer.add_param_group({
                         "params": new_chart.parameters()

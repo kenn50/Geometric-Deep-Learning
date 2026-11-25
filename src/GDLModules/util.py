@@ -186,26 +186,47 @@ def plot3d(d, title="3D plot", color=None):
 
 #Created by ChatGPT 6.2 sol
 class ChamferLoss(nn.Module):
-    def forward(self, pred, target):
+    def forward(self, pred, target, return_components=False):
         """
-        pred:   (B, N, D)
-        target: (B, M, D)
+        Symmetric squared Chamfer distance between two point clouds.
+
+        Args:
+            pred:   Generated points, shape (B, N, D) or (N, D).
+            target: Real data points, shape (B, M, D) or (M, D).
+            return_components: Return fidelity and coverage separately.
+
+        Fidelity (pred -> target):
+            Measures how close each generated point is to the nearest
+            real data point. Encourages the generated charts to stay
+            on the data manifold.
+
+        Coverage (target -> pred):
+            Measures how close each real data point is to the nearest
+            generated point. Encourages the atlas to cover the entire
+            data manifold.
+
+            Adding a new chart cannot increase the coverage loss,
+            provided the existing generated points remain unchanged.
+        Returns:
+            fidelity + coverage, or (fidelity, coverage) if
+            return_components=True.
         """
-        
-        
+
         pred = pred.unsqueeze(0) if pred.dim() == 2 else pred
         target = target.unsqueeze(0) if target.dim() == 2 else target
-        dist = torch.cdist(pred, target, p=2) ** 2
 
+        dist = torch.cdist(pred, target, p=2).square()
 
-        # Nearest neighbor in each direction
-        pred_to_target = dist.min(dim=2).values
-        target_to_pred = dist.min(dim=1).values
+        # Fidelity: Are all generated points close to the manifold?
+        fidelity = dist.min(dim=-1).values.mean()
 
-        return (
-            pred_to_target.mean() +
-            target_to_pred.mean()
-        )
+        # Coverage: Are all real points represented by the atlas?
+        coverage = dist.min(dim=-2).values.mean()
+
+        if return_components:
+            return fidelity, coverage
+
+        return fidelity + coverage
 
 
 
@@ -232,7 +253,7 @@ class MLP(nn.Module):
         last_linear = nn.Linear(hidden_structure[-1], output_dim)     
         #initialize last layer weights to zero
         if last_zero==True:
-            nn.init.normal_(last_linear.weight, std=1e-3)
+            nn.init.normal_(last_linear.weight, std=0.1)
             nn.init.zeros_(last_linear.bias)
         layers.append(last_linear)
         if activation_last_layer is not None:
@@ -244,53 +265,33 @@ class MLP(nn.Module):
     
 
 
-class MLP_CR(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_structure, activation=nn.ReLU(), activation_last_layer=None):
-        
-        super().__init__()
-        layers = []
-        layers.append(nn.Linear(input_dim, hidden_structure[0]))
-        layers.append(activation)
-        for i in range(len(hidden_structure) - 1):
-            layers.append(nn.Linear(hidden_structure[i], hidden_structure[i + 1]))
-            layers.append(activation)
-            
-        last_linear = nn.Linear(hidden_structure[-1], output_dim)
-        
-        #initialize last layer weights to zero
-        nn.init.zeros_(last_linear.weight + 1e-6)  
-        nn.init.zeros_(last_linear.bias + 1e-6)
-        layers.append(last_linear)
-        
-        if activation_last_layer is not None:
-            layers.append(activation_last_layer)
-        
-
-        self.network = nn.Sequential(*layers)
-
-        
-        self.center = nn.Parameter(torch.randn(output_dim))
-        self.rotate = nn.Linear(input_dim, output_dim, bias=False)
-
-    def forward(self, x):
-        return self.center + self.rotate(x) + self.network(x)
 
 
 
-
-#Made by gpt 6.1 sol
-def sample_uniform_ball_like(z, radius=1.0):
-    directions = torch.randn_like(z)
+def sample_uniform_ball(shape, radius=1.0, device=None, dtype=None):
+    directions = torch.randn(shape, device=device, dtype=dtype)
     directions = directions / directions.norm(
-        dim=1, keepdim=True
+        dim=-1, keepdim=True
     ).clamp_min(1e-12)
 
-    d = z.shape[1]
+    d = shape[-1]
+
     radii = torch.rand(
-        (len(z), 1), device=z.device, dtype=z.dtype
+        (*shape[:-1], 1),
+        device=device,
+        dtype=dtype
     ).pow(1.0 / d)
 
     return radius * radii * directions
+
+
+def sample_uniform_ball_like(z, radius=1.0):
+    return sample_uniform_ball(
+        z.shape,
+        radius=radius,
+        device=z.device,
+        dtype=z.dtype
+    )
 
 
 def batched_rbf(x, y, sigma = 1):
